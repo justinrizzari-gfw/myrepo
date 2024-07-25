@@ -1,0 +1,281 @@
+---
+title: "Training questions Part 1 Vessel Track"
+author: "Adel"
+date: "06/07/2021"
+output: html_document
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+### libraries
+# Load fishwatchr
+library(fishwatchr)
+library(tidyverse)
+library(glue)
+library(rnaturalearthhires)
+library(rgeos)
+### 
+
+###
+# Establish connection to BigQuery project
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+###
+
+```
+
+## Q1 Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 without any filters to ‘clean’ the data. 
+
+Based on the MMSI (marinetraffic) -- there are two boats broadcasting with this number - 1) most recently as a reefer TUNA QUEEN and 2) last year as an known generic vessel flagged to Panama. So not a fishing vessel. For this reason -- run the query from pipe_vYYYYMMDD rather than pipe_vYYYYMMDD_fishing?
+
+Note on workflow, I ran the query based on what I found from the example queries, basic vessel track and updated a bit.
+
+Q. Unsure on how I include partition_time within this query
+
+
+```{r}
+
+### query 
+track <- c(
+  "
+#standardSQL
+-- Identifying track of interest
+-- Hannah Linder, Updated September 17,2020
+-- AH 6-7-21 Updated to swop table versions and swop DATE with TIMESTAMP and include fields required to make fishwatchR plot work and remove part the excludes noise
+  --Basic query to get 'clean' tracks for any vessel of interest
+
+  -- WARNING: Queries to get vessel tracks can be very large. Make sure to
+  -- double check that the date filters are set correctly and think twice
+  -- before running queries over large date ranges. If getting tracks for
+  -- multiple vessels in the same time period, do so in the same query,
+  -- do not run two separate queries.
+
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (TIMESTAMP('2017-10-24'));
+
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (TIMESTAMP('2017-11-06'));
+
+
+SELECT
+ssvid,
+timestamp,
+lat,
+lon, 
+speed_knots,
+nnet_score
+FROM `world-fishing-827.gfw_research.pipe_v20201001`
+WHERE
+ssvid = '352894000'
+-- Set date filters to limit query size
+AND
+---HANNAH: to reduce query size here you use _PARTITIONTIME instead of timestamp
+--- ADEL: updated below note this reduced from TB to 15 GB
+_PARTITIONTIME>=minimum()
+AND
+_PARTITIONTIME<=maximum()
+ORDER BY
+timestamp
+")
+
+## run query
+noisy_track<-gfw_query(query = track, 
+                          run_query = TRUE, 
+                          con = con)
+
+## inspect track
+
+fishing_track_review(track_df = noisy_track$data,
+                     color_fishing = FALSE,
+                     globe_location = 'lowerright',
+                     time_series_labels = c('lat', "speed_knots"),
+                     vessel_name = 'TUNAQUEEN')
+```
+There are periods where track intersects land, jumps about and speed  = 0.
+
+```{r}
+# identify dates when speed drops to zero and latitude jumps
+
+tmp<-noisy_track$data[which(noisy_track$data$speed_knots == 0),]
+
+min(tmp$timestamp)
+max(tmp$timestamp)
+
+## between 2017-10-27 and 2017-11-02 something odd going on
+```
+
+## Q2 Based on what you are seeing, investigate the connection between, ssvid, vessel id, and seg_id during the time the track seems to make less sense using tables `pipe_production_v20201001.segment_info` and `world-fishing-827.gfw_research.pipe_v20201001_segs`. Can you identify what is occurring in the data to cause the wonky tracks?
+
+Note: I took this from a slide on the 04 research tables. Does this highlight a need for more discussion on segs during training / within the training resources.
+
+
+```{r segs check}
+
+# ### query A
+# vs <- c("
+# ## this is from research tables slides 04 slide 21 and is 2.6 TB to run - I edited to run for more than one day (probably not a good idea for segs level data)
+# SELECT
+#   ssvid,
+#   seg_id,
+#   overlapping_and_short,
+#   good_seg,
+#   good_seg2,
+#   positions
+# FROM
+#   `gfw_research.pipe_v20201001_segs`
+# WHERE
+#   seg_id IN ( SELECT
+#     DISTINCT seg_id
+#   FROM `gfw_research.pipe_v20201001`
+#   WHERE first_timestamp >= ('2017-10-27') AND last_timestamp < =('2017-11-02')
+#     AND ssvid = '352894000')
+# ")
+
+### query B
+## this is from 09 encounters slide 13 and is 9.3 GB to run. Decided to run for whole timeframe
+
+segs <- c("
+
+SELECT 
+ssvid,
+min_lat,
+min_lon,
+max_lon,
+max_lat,
+first_timestamp,
+last_timestamp,
+good_seg,
+good_seg2,
+overlapping_and_short
+FROM `world-fishing-827.gfw_research.pipe_v20201001_segs`
+WHERE
+ssvid = '352894000'
+AND
+first_timestamp BETWEEN timestamp('2017-10-24') AND timestamp('2017-11-06')
+ORDER BY
+first_timestamp
+
+
+")
+
+segs_check <- fishwatchr::gfw_query(query = segs,
+                                          run_query = TRUE,
+                                          con = con)$data
+
+```
+
+Segs_check output shows that there is:
+One day (2017-10-27) where there are no good_segs or good_segs2 (i.e. positions are < 5 etc.) and overlapping_and_short it TRUE, this means that this segment overlaps in time with another segment on the same MMSI == bad data.
+
+One day (2017-10-30) where there are no good_segs but there are good_segs2 which means that it has more than 5 positions but that the vessel is not moving.
+
+One day (2017-10-30) where there are no good_segs (it doesn't have > 5 positions etc) but there are good_segs2 which means that it has more than 5 positions but that the vessel is not moving.
+
+One day (2017-11-23) where there are good_segs and good_segs 2 which means there are data > 5 positions, it has moved > 100 m and the distance from shore < 0).
+
+Q for Hannah -- I don't really understand the reason behind overlapping_and_short creating noise- probably because I don't really understand how the segmenter works.
+
+Q -- so my queries I think were right on this one, just not the intepretation. Think th
+
+```{sql seg info query}
+
+## pipe_production_v20201001.segment_info
+
+seginfo<-c("
+            SELECT
+          *
+          FROM `world-fishing-827.pipe_production_v20201001.segment_info`
+          WHERE ssvid = '352894000'
+          AND 
+          first_timestamp BETWEEN timestamp('2017-10-24') AND timestamp('2017-11-06')
+          ORDER BY
+          first_timestamp
+           ")
+
+```
+
+```{r seg info inspect}
+
+seginfo_check <- gfw_query(query = seginfo,
+                                          run_query = TRUE,
+                                          con = con)$data
+```
+So from this seginfo_check, it looks like this vessel retains the same MMSI and switches identity from the ANELLY to the TUNAQUEEN.
+It has two vessel ids for ANELLY one on 27-10 (vessel id: 1512ca283-37b5-2737-87b9-047cf0f30433), another (786d7faf6-65d3-6045-cfc8-3fd0ba9a9f58) still under ANELLY on 30-10 then detected as TUNAQUEEN (on the same vessel id: 1512ca283-37b5-2737-87b9-047cf0f30433).
+
+
+Together this shows that likely on the 27-10 this boats switches identity to the ANELLY then switches back to the TUNA QUEEN on the 23-11.
+
+Notes: I couldn't find any (?) info on pipe_production in training materials. But I looked at the preview of the table and based on that filtered on ssvid
+
+
+
+## Q3 Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 again but removing noise. 
+
+```{sql clean track plot}
+### query 
+track <- c(
+  "
+  #standardSQL
+-- Identifying track of interest
+-- Hannah Linder, Updated September 17,2020
+--
+  --Basic query to get 'clean' tracks for any vessel of interest
+
+  -- WARNING: Queries to get vessel tracks can be very large. Make sure to
+  -- double check that the date filters are set correctly and think twice
+  -- before running queries over large date ranges. If getting tracks for
+  -- multiple vessels in the same time period, do so in the same query,
+  -- do not run two separate queries.
+
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (TIMESTAMP('2017-10-24'));
+
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (TIMESTAMP('2017-11-06'));
+
+
+SELECT
+ssvid,
+timestamp,
+lat,
+lon,
+speed_knots,
+nnet_score
+FROM `world-fishing-827.gfw_research.pipe_v20201001`
+WHERE
+ssvid = '352894000'
+-- Set date filters to limit query size
+AND
+timestamp>=minimum()
+AND
+timestamp<=maximum()
+AND
+---portion of the code removes noisey track segments
+seg_id IN (
+  SELECT
+  seg_id
+  FROM
+  `gfw_research.pipe_v20201001_segs`
+  WHERE
+  good_seg
+  AND positions > 10 
+  AND NOT overlapping_and_short)
+ORDER BY
+timestamp
+")
+```
+
+```{r clean track plot}
+
+## run query
+clean_track<-gfw_query(query = track, 
+                          run_query = TRUE, 
+                          con = con)
+
+## inspect track
+fishing_track_review(track_df = clean_track$data,
+                     color_fishing = FALSE,
+                     globe_location = 'lowerright',
+                     time_series_labels = c('lat', "speed_knots"),
+                     vessel_name = 'TUNAQUEEN')
+```

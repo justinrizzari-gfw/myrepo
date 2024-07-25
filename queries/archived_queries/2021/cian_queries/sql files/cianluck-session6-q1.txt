@@ -1,0 +1,157 @@
+-------------------------------------------------------------
+-- How many encounters occurred in NPFC between trawlers and 
+-- carrier vessels in the last three months 
+-- (July - September 2021)?
+-------------------------------------------------------------
+
+-----------------------------------------------
+-- Specify date range
+-----------------------------------------------
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE('2021-07-01'));
+
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE('2021-09-30'));
+
+WITH
+
+-----------------------------------------------
+-- Retrieve initial encounter data, specifing time range and lat/lon
+-- JSON_EXTRACT is used to seperate the listed event_info data of interest into separate columns
+-----------------------------------------------
+    encounters AS (
+    SELECT
+        event_id,
+        vessel_id,
+        event_start,
+        event_end,
+        lat_mean,
+        lon_mean,
+        JSON_EXTRACT(event_info,
+        "$.median_distance_km") AS median_distance_km,
+        JSON_EXTRACT(event_info,
+        "$.median_speed_knots") AS median_speed_knots,
+        -- extract the ssvid for both vessels involved in encounter
+        JSON_VALUE(event_vessels,'$[0].ssvid') AS ssvid_a,
+        JSON_VALUE(event_vessels,'$[1].ssvid') AS ssvid_b,
+    SPLIT(event_id, ".")[ORDINAL(1)] AS event,
+    CAST (event_start AS DATE) event_date,
+    EXTRACT(YEAR FROM event_start) AS year
+    FROM
+    `world-fishing-827.pipe_production_v20201001.published_events_encounters`
+    WHERE
+        DATE(event_start) >= minimum()
+        AND DATE(event_end) <= maximum()
+        AND lat_mean < 90
+        AND lat_mean > -90
+        AND lon_mean < 180
+        AND lon_mean > -180),
+
+-----------------------------------------------
+-- grab daily information on ssvid corresponding to vessel_id 
+-----------------------------------------------
+    ssvid_map AS (
+    SELECT
+        vessel_id,
+        ssvid
+    FROM
+        `world-fishing-827.pipe_production_v20201001.vessel_info`),
+
+-----------------------------------------------
+-- encounters with ssvid
+-----------------------------------------------
+ -- Join the encounters data with the ssvid data on the same vessel_id and event day to ensure correct SSVID
+    encounter_ssvid AS (
+    SELECT * EXCEPT(vessel_id)
+    FROM (
+    SELECT
+    *
+    FROM
+    encounters) a
+    JOIN (
+    SELECT *
+    FROM
+    ssvid_map) b
+    ON a.vessel_id = b.vessel_id),
+
+-----------------------------------------------
+-- create a list of carrier vessels
+-----------------------------------------------
+    carrier_vessels AS (
+    SELECT
+        identity.ssvid AS ssvid
+    FROM
+        `vessel_database.all_vessels_v20210601`
+    LEFT JOIN
+        UNNEST(registry)
+        -- LEFT JOIN
+        --  UNNEST(activity)
+    WHERE
+        is_carrier
+    AND confidence >= 3 ),
+
+-----------------------------------------------
+-- trawlers
+-----------------------------------------------
+    trawlers AS (
+    SELECT 
+        ssvid,
+        year
+    FROM 
+        `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+    WHERE 
+        best.best_vessel_class = 'trawlers'
+        AND year = 2021,
+
+-----------------------------------------------
+-- keep only trawlers and carriers
+-----------------------------------------------
+    encounters_trawlers_carriers AS(
+        SELECT 
+            *
+        FROM 
+            encounter_ssvid 
+        WHERE 
+            (ssvid_a IN (SELECT ssvid FROM carrier_vessels)
+            AND ssvid_b IN (SELECT ssvid FROM trawlers)
+            OR (ssvid_a IN (SELECT ssvid FROM trawlers)
+            AND ssvid_b IN (SELECT ssvid FROM carrier_vessels))
+    ),
+
+-----------------------------------------------
+-- read in shapefile of NPFC
+-----------------------------------------------
+    npfc AS (
+        SELECT
+            ST_GEOGFROMTEXT(string_field_1) AS polygon
+        FROM
+            `world-fishing-827.ocean_shapefiles_all_purpose.NPFC_shape`
+        ),
+
+------------------------------------------------
+-- Filter fishing to only include activity within the npfc
+------------------------------------------------
+  encounters_in_npfc AS (
+    SELECT
+      *
+    FROM
+      encounters_trawlers_carriers   
+    WHERE
+    IF
+      (ST_CONTAINS( (
+          SELECT
+            polygon
+          FROM
+            npfc),
+          ST_GEOGPOINT(lon, lat)),
+        TRUE,
+        FALSE)
+    )
+
+-----------------------------------------------
+-- return encounters_in_npfc
+-----------------------------------------------
+SELECT
+*
+FROM
+encounters_in_npfc

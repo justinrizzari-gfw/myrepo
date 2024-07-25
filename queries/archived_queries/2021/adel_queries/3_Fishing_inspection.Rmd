@@ -1,0 +1,282 @@
+---
+title: "3_Fishing_inspection"
+author: "Adel"
+date: "09/08/2021"
+output: html_document
+---
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+### libraries
+# Load fishwatchr
+library(fishwatchr)
+library(tidyverse)
+library(glue)
+library(rnaturalearthhires)
+library(rgeos)
+### 
+
+###
+# Establish connection to BigQuery project
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+###
+
+```
+
+## Question 1
+1.	We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?
+
+```{r fishing track query}
+
+##Q Notes -- I took this query from the fishwatchr documentation, updated (DATE to timestamp) and adapted (changed timestamp to _partitiontime) and this reduced the cost of the query from ~ 782 GB to 7 GB
+### query
+
+track <- c("
+
+SELECT 
+  ssvid
+	,lon
+	,lat
+	,TIMESTAMP
+	,speed_knots
+	,- 1 * elevation_m AS depth_m
+	,distance_from_shore_m / 1000 AS distance_from_shore_km
+	,nnet_score
+
+FROM `gfw_research.pipe_v20201001_fishing` 
+WHERE seg_id IN (
+		SELECT seg_id
+		FROM `gfw_research.pipe_v20201001_segs`
+		WHERE overlapping_and_short IS FALSE
+			AND good_seg IS TRUE
+			)
+			
+	AND ssvid = '367650000'
+	AND _partitiontime >= TIMESTAMP('2017-03-01') AND _partitiontime <= TIMESTAMP('2017-03-05')
+	AND nnet_score IS NOT NULL
+ORDER BY TIMESTAMP
+
+")
+
+```
+
+```{r run query}
+
+## run query
+clean_track<-gfw_query(query = track, 
+                          run_query = TRUE, 
+                          con = con)
+```
+
+```{r plot track}
+## inspect track
+
+
+clean_track$data$ssvid<-as.factor(clean_track$data$ssvid)
+clean_track$data$timestamp<-clean_track$data$TIMESTAMP ### need to do this for plot function to run
+
+fishing_track_review(track_df = clean_track$data,
+                     color_fishing = TRUE,
+                     globe_location = 'lowerright',
+                     time_series_labels = c('speed_knots','depth_m','distance_from_shore_km'),
+                     vessel_name = 'Alaska Endeavor')
+
+```
+This is a small-ish trawler (37m) -- and it's estimates of fishing segments seems really high. Are they inverted with the steaming segs? 
+
+## Question 2
+2.	How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?
+
+```{r fishing hours from research pipe}
+##
+hoursq<- c("
+---------------------------------------
+--  Note: I took the query from example queries https://github.com/GlobalFishingWatch/bigquery-documentation-wf827/blob/f546b4efd638230eb83ad61013ffb4ad7e74f290/queries/examples/2019/Q4/fishing_effort/research-table-examples-1.sql
+-- and updated to have the partition time
+
+-- How many hours did ssvid 123456789 fish on January 1, 2019,
+-- in segments that are likely not noise? (use `good_segs`)
+-------------------------------------
+
+WITH
+  good_segments AS (
+  SELECT * FROM
+    `gfw_research.pipe_v20201001_segs`
+  WHERE good_seg)
+--
+--
+SELECT
+  sum(fishing_hours) fishing_hours
+FROM
+  `gfw_research.pipe_v20201001_segs_daily`
+WHERE
+  ssvid = '367650000'
+  and _partitiontime >= timestamp('2017-03-01') AND _partitiontime <= timestamp('2017-03-05')
+  and seg_id in (select seg_id from good_segments)
+
+")
+
+hours<-gfw_query(query = hoursq, 
+                          run_query = TRUE, 
+                          con = con)
+
+```
+
+98 fishing hours from estimate that uses good segs and research pipe
+
+```{r fishing hours from pipe_production_v20201001.proto_events_fishing}
+## I couldn't find an example query for fishing events in git hub examples, slack or the slides
+
+```
+
+## Question 3
+3.	What type of fishing vessel is it? 
+
+```{r vessel info}
+#
+
+tq<- c(
+"
+SELECT 
+ssvid,
+inferred.inferred_vessel_class_ag,
+registry_info.best_known_vessel_class,
+best.best_vessel_class,
+on_fishing_list_known,
+on_fishing_list_nn,
+on_fishing_list_sr,
+on_fishing_list_best
+FROM `world-fishing-827.gfw_research.vi_ssvid_v20210706`
+WHERE ssvid = '367650000'
+
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+
+This is a trawler
+
+## Question 4
+4.	Provide the other vessel identity information and registry records during this time.
+
+Note this query returns no records...
+```{r vessel database information}
+
+tq<- c(
+"
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE("2017-03-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE("2017-03-05"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2018 AS INT64));
+
+--####
+SELECT
+auth_ssvid,
+auth_shipname,
+auth_imo,
+auth_flag,
+registry_authorized_to,
+registry_authorized_from,
+reg,
+first_timestamp,
+last_timestamp
+FROM(
+ SELECT
+  identity.ssvid as auth_ssvid,
+  shipname as auth_shipname,
+  identity.imo as auth_imo,
+  flag as auth_flag,
+   authorized_to as registry_authorized_to,
+  authorized_from as registry_authorized_from,
+  is_active as registry_active,
+  SAFE_CAST( SPLIT(list_uvi, '-')[OFFSET(0)] AS string) AS reg,
+    scraped,
+    list_uvi,
+   geartype_original as registry_gear,
+   feature_gear,
+   last_modified,
+   first_timestamp,
+   last_timestamp
+FROM
+  `vessel_database.all_vessels_v20210601`
+  LEFT JOIN UNNEST(registry)
+  LEFT JOIN UNNEST(activity)
+  LEFT JOIN UNNEST(feature.geartype) as feature_gear
+WHERE
+identity.ssvid = '367650000'
+AND
+authorized_to>first_timestamp
+AND
+authorized_from<last_timestamp
+AND
+DATE(last_timestamp) >= minimum()
+AND
+DATE(first_timestamp) <= maximum()
+)
+WHERE
+(EXTRACT (YEAR from registry_authorized_to) = yoi()
+OR
+EXTRACT (YEAR from registry_authorized_from) = yoi())
+GROUP BY
+auth_ssvid,
+auth_shipname,
+auth_imo,
+auth_flag,
+registry_authorized_to,
+registry_authorized_from,
+reg,
+first_timestamp,
+last_timestamp
+")
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+When I run the query that doesn't specify the time frame, it looks like it was dropped from the US registry in 2016, in 2017 it wasn't a registered fishing vessel
+```{r}
+tq<- c(
+"
+SELECT
+ matched, loose_match,
+ identity,
+ feature,
+ activity,
+ ARRAY(
+   SELECT list_uvi
+   FROM UNNEST(registry)
+   GROUP BY 1 ) AS list_uvi
+FROM `world-fishing-827.vessel_database.all_vessels_v20210601`
+WHERE identity.ssvid = '367650000'
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+
+## Question 5
+5.	Let’s take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?
+
+## Ran out of time...

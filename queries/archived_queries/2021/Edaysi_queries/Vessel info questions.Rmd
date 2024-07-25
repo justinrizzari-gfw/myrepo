@@ -1,0 +1,135 @@
+---
+title: "Vessel info questions"
+author: "Edaysi Bucio"
+date: "7/20/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Vessel Info Questions practice  
+
+## Establish connection to BigQuery project
+
+```{r}
+con <- DBI::dbConnect(bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+
+#Run this line if you receive an error about your BigQuery credentials
+#bq_auth() 
+
+```
+
+
+
+## Download packages
+```{r}
+devtools::install_github("ropensci/rnaturalearthhires") #If problems isntalling the package, look at this https://github.com/ropensci/rnaturalearthhires/issues/1
+
+#Install fishwatchr
+devtools::install_github("GlobalFishingWatch/fishwatchr")
+library(fishwatchr)
+library(tidyverse)
+library(bigrquery)
+library(ggsci) 
+library(rnaturalearth)
+library(rnaturalearthhires)
+library(sf)
+library(raster)
+library(viridis)
+library(googledrive)
+library(sp)
+library(devtools)
+
+```
+
+1.	What is the name, callsign, flag state, and imo of the vessel in question one during the time period specified in question one?
+MMSI 352894000 
+
+** Answer: The most common values are: shipname TUNA QUEEN, call gish HPFK, flag state PAN, and IMO 9278612. Nevertheless, during 2017 the vessel was broadcasting with the name ANELLY, and IMO VRYC3 according to AIS info. 
+
+```{sql connection = con, output.var = "vessel_info_vi"}
+
+SELECT
+ssvid, year, 
+activity.first_timestamp, 
+activity.last_timestamp, 
+ais_identity.n_shipname,  # Info from identities (shipname, callsign, IMO, flag, etc.) broadcast by that MMSI in AIS messages
+ais_identity.n_shipname_mostcommon, 
+ais_identity.n_callsign, 
+ais_identity.n_callsign_mostcommon, 
+ais_identity.n_imo, 
+ais_identity.n_imo_mostcommon, 
+ais_identity.flag_mmsi, 
+registry_info.best_known_shipname, # The identity information associated with the MMSI sourced from vessel registries 
+registry_info.best_known_callsign, 
+registry_info.best_known_imo, 
+registry_info.best_known_flag
+FROM gfw_research.vi_ssvid_byyear_v20210706
+WHERE ssvid IN ('352894000')
+AND year = 2017
+
+```
+
+
+
+2.	Is the above answer different if you pull from the vessel info table (gfw_research.vi_ssvid_v) versus the vessel registry table (vessel_database.all_vessels_v)?
+
+**Answer: Info form both tables allow me to identified that two different shipnames were broadcasted with the same MMSI number**
+
+```{sql connection = con, output.var = "vessel_info_vd"}
+
+1SELECT
+identity.ssvid,
+identity.n_shipname,
+identity.n_callsign,
+identity.flag,
+identity.imo,
+a.first_timestamp,
+a.last_timestamp,
+FROM `world-fishing-827.vessel_database.all_vessels_v20210601`, UNNEST (activity) as a
+WHERE identity.ssvid in ('352894000')
+```
+
+```{sql connection = con, output.var = "vessel_info_2"}
+
+SELECT
+ssvid, 
+ais_identity.n_shipname,
+ais_identity.n_shipname_mostcommon,
+ais_identity.n_callsign,
+ais_identity.n_callsign_mostcommon,
+ais_identity.n_imo,
+ais_identity.n_imo_mostcommon,
+best.best_flag
+FROM `world-fishing-827.gfw_research.vi_ssvid_v20210706` 
+WHERE ssvid in  ('352894000') 
+
+
+```
+
+
+
+3.	Should you use gfw_research.vi_ssvid_v or gfw_research.vi_ssvid_byyear_v to answer question 1 in the vessel info section?
+
+**Answer: I'd use the vi_ssvid_byyear_v to look only at 2017 data**
+
+
+4.	Is the vessel considered a ‘carrier’? Is this different from its ‘best’ vessel class?
+**Answer: It is considered a specialized_reefer** 
+
+
+5.	Was the vessel ‘authorized’ by any RFMO during the October 24th 2017 - November 6 2017? If so, which ones and what are the registry periods?
+**Answer: Looks like no authorization after 2017**
+
+```{sql connection = con, output.var = "vessel_auth"}
+SELECT
+*
+FROM `world-fishing-827.vessel_database_staging.all_vessels_matched_source_v20210701` 
+WHERE mmsi = 352894000
+AND first_timestamp > '2017-01-01'
+
+
+```
+

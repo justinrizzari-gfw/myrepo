@@ -1,0 +1,302 @@
+---
+title: "Training Questions"
+author: "Rollan Geronimo"
+date: "12/14/2021"
+output: 
+  bookdown::html_document2: 
+    toc: true
+    code_folding: hide
+    toc_depth: 2.0
+---
+
+```{r setup, include=FALSE, echo = TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries, include=FALSE}
+library(bigrquery)
+library(fishwatchr)
+library(dplyr)
+library(ggplot2)
+library(glue)
+library(tidyverse)
+library(raster)
+library(sf)
+library(gt)
+
+BQ_connection <-  dbConnect(bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+```
+
+# Fishing Inspection Questions
+
+## Fishing track and points plot
+**1.	We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?**
+
+There are tracks labelled as apparent fishing but looks like non-fishing (e.g., cruising / transiting) patterns. 
+
+```{r fishingInspection_Q1, echo = TRUE, message = FALSE, warning = FALSE}
+
+ssvid = '367650000'
+dateRange <- c("2017-03-01","2017-03-05")
+
+# ssvid = '417000121'
+# dateRange <- c("2020-01-01", "2020-12-31")
+query_Tracks <- glue::glue(
+  " SELECT
+    ssvid,
+    seg_id,
+    lon,
+    lat,
+    hours,
+    timestamp,
+    nnet_score
+    FROM
+    `gfw_research.pipe_v20201001_fishing` 
+    WHERE seg_id IN (
+      SELECT seg_id 
+      FROM `gfw_research.pipe_v20201001_segs` 
+      WHERE 
+      overlapping_and_short IS FALSE AND 
+      good_seg IS TRUE) AND
+    ssvid = '{ssvid}' AND
+    _partitiontime >= TIMESTAMP('{dateRange[1]}') AND 
+    _partitiontime <= TIMESTAMP('{dateRange[2]}') AND
+    # Should we include nnet_scores that are NULL?
+    nnet_score IS NOT NULL 
+    ORDER BY timestamp"
+)
+
+vTracks <- gfw_query(query = query_Tracks, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+plot_vessel_track_fish(
+  vTracks,
+  bounding_box_man = NA,
+  color_fishing = TRUE,
+  color_by = "nnet_score",
+  map_res = 10,
+  theme = "light",
+  buffer = 2,
+  add_gridlines = TRUE,
+  gfw_proj_name = "Equal Earth",
+  vessel_name = "Alaska Endeavor" # name obtained by searching for the MMSI in the GFW map
+)
+
+# # This is another way to plot the tracks
+# land_sf <- rnaturalearth::ne_countries(scale = 10, returnclass = 'sf')
+# plot_vessel_track(
+#   vTracks,
+#   lat = "lat",
+#   lon = "lon",
+#   show_fishing = TRUE,
+#   spatial = TRUE
+# )
+
+```
+
+
+**2.	How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?**
+
+The proto_events_fishing table will give a slightly restrictive fishing (based on consistency and duration filter).
+
+```{r fishingInspection_Q2, echo = TRUE, message = FALSE, warning = FALSE}
+q_events <- glue::glue(
+  " SELECT
+    SUM(IF(event_type = 'fishing', 
+     TIMESTAMP_DIFF(event_end, event_start, MINUTE),
+     0))/60 AS fishing_hours
+    FROM
+    `pipe_production_v20201001.proto_events_fishing` 
+    WHERE
+    event_start BETWEEN TIMESTAMP('{dateRange[1]}') AND TIMESTAMP('{dateRange[2]}') 
+    AND
+    seg_id LIKE '{ssvid}-%' # But seg_id does not always rely only on ssvid. It can sometimes be imo. 
+    "
+) # better to get the seg_id and match with the seg_id in the proto table
+
+# "Fishing hours" not exactly interpreted as gear-in-the-water time but more broadly in terms of vessel behavior that appears as fishing operations.
+# GFW map now uses proto_fishing_events instead of pipe_fishing 
+# Can use proto_fishing_events for single vessel analysis
+# Use fishing days but put note on what is counted as 'fishing day'
+# JSON_EXTRACT_SCALAR(event_vessels,"$[0].ssvid") as ssvid
+
+events_hours <- gfw_query(query = q_events, 
+                          run_query = TRUE, 
+                          con = con)$data
+```
+
+The total fishing hours is `r round(sum(vTracks[vTracks$nnet_score == 1, "hours"]))` out of `r round(sum(vTracks$hours))` total voyage hours using the *'gfw_research.pipe_v20201001_fishing'* table. 
+
+The total fishing hours using the *'pipe_production_v20201001.proto_events_fishing'* is round(`r events_hours`).
+
+
+**3.	What type of fishing vessel is it?**
+
+ 
+
+```{r fishingInspection_Q3, echo = TRUE, message = FALSE, warning = FALSE}
+q_vesselClass <- glue::glue(
+  "SELECT 
+    year, 
+    inferred.inferred_vessel_class AS inferred_class, 
+    registry_info.best_known_vessel_class AS registry_class,
+    best.best_vessel_class AS best_class
+  FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706` 
+  WHERE ssvid = '{ssvid}' AND year = 2017
+   "
+)
+
+v_class <- gfw_query(query = q_vesselClass, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+```
+Best vessel class = `r v_class$best_class`.
+
+**4.	Provide the other vessel identity information and registry records during this time.**
+
+The vessel identity information can be derived from the vessel_database.all_vessels_v20210701. Registry information is in the vessel info table vi_ssvid_byyear (since we need to get the registry info for the given period). 
+
+What is the difference between "normalized" and non-normalized values in the *vi_ssvid_byyear* table?
+
+```{r fishingInspection_Q4, echo = TRUE, message = FALSE, warning = FALSE}
+
+q_vesselInfo <- glue::glue(
+  "SELECT 
+     ssvid,
+     year,
+     registry_info.best_known_shipname,
+     ais_identity.callsign,
+     ais_identity.imo,
+     ais_identity.shiptype,
+     ais_identity.flag_mmsi,
+     inferred.inferred_vessel_class,
+     inferred.inferred_vessel_class_score_byyear,
+     registry_info.registries_listed,
+     registry_info.best_known_flag,
+     registry_info.best_known_callsign,
+     registry_info.best_known_imo,
+     registry_info.best_known_vessel_class,
+     registry_info.best_known_length_m,
+     registry_info.best_known_tonnage_gt,
+     registry_info.best_known_engine_power_kw,
+     registry_info.best_known_crew_size,
+     best.registry_net_disagreement
+  FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913` 
+  WHERE ssvid = '{ssvid}' AND year = 2017 
+   "
+)
+ 
+v_info <- gfw_query(query = q_vesselInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+v_info %>% t() %>% data.frame() %>% rownames_to_column(var="parameters") %>% rename(values = '.') %>% 
+  gt() %>%
+  tab_style(
+    style = cell_text(color = "black", weight = "bold"),
+    locations = list(
+      cells_row_groups(),
+      cells_column_labels(everything())
+    )
+  ) %>% 
+  cols_label(
+    parameters = "Parameters",
+    values = "Values"
+  )
+
+```
+
+**5.	Let’s take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?**
+
+I used the 'proto_events_fishing_v20211212' table. 
+
+```{r fishingInspection_Q5, echo = TRUE, message = FALSE, warning = FALSE}
+
+q_effort <- glue::glue(
+  "WITH 
+positions AS (
+          SELECT
+          ssvid,
+          lat,
+          lon,
+          nnet_score,
+          night_loitering,
+          hours
+          FROM `world-fishing-827.gfw_research.pipe_v20201001_fishing`,
+          UNNEST(regions.rfmo) rfmo
+          WHERE EXTRACT(DATE FROM _PARTITIONTIME) BETWEEN ('2018-01-01') AND ('2018-12-31')
+              AND seg_id IN (
+                  SELECT seg_id
+                  FROM `world-fishing-827.gfw_research.pipe_v20201001_segs`
+                  WHERE good_seg
+                  AND NOT overlapping_and_short
+              )
+              AND rfmo = 'NPFC'
+      ),
+
+fishing_vessels AS (
+          SELECT
+              ssvid,
+              year,
+              best_vessel_class AS geartype,
+              best_flag as flag
+          FROM `world-fishing-827.gfw_research.fishing_vessels_ssvid_v20210913` 
+          WHERE year = 2018
+          AND best_flag = 'CHN'
+          AND best_vessel_class = 'squid_jigger'
+      ),
+
+positions_vi AS (
+    SELECT * EXCEPT(nnet_score, night_loitering),
+        IF(b.geartype = 'squid_jigger', night_loitering, nnet_score) as nnet_score
+    FROM positions a
+    LEFT JOIN fishing_vessels b
+    USING (ssvid)
+),
+
+grouped AS (
+    SELECT 
+        FLOOR(lat * 10)/10 as lat_bin,
+        FLOOR(lon * 10)/10 as lon_bin,
+        SUM(IF(nnet_score > 0.5, hours, 0) ) AS fishing_hours
+    FROM positions_vi
+    GROUP BY 1,2
+)
+
+SELECT * FROM grouped
+   "
+)
+
+fishing_effort <- gfw_query(query = q_effort, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+fishing_effort %>% filter(fishing_hours>1) %>%
+    ggplot() +
+    geom_raster(aes(x = lon_bin,
+                    y = lat_bin,
+                    fill = fishing_hours)) +
+    geom_gfw_eez(center = 160) +
+    geom_gfw_land(center = 160) +
+    #coord_sf(crs = CRS('+proj=longlat +datum=WGS84'), expand=F)+
+#    lims(x = lonRange, y = latRange) +
+    scale_fill_gradientn(colors = gfw_palette('map_effort_dark'),
+                         limits = c(0,500),
+                         oob = scales::squish,
+                         na.value = NA) +
+    labs(fill = 'Fishing hours') +
+    theme_gfw_map() +
+    theme(axis.text = element_text(family = "Roboto", color = "#848b9b", 
+              size = 10),
+          legend.text = element_text(family = "Roboto", 
+              color = "#848b9b", size = 10), legend.title = element_text(family = "Roboto Bold", 
+              color = "#363c4c", size = 10), plot.title = element_text(family = "Roboto Bold", 
+              color = "#363c4c", size = 12), plot.subtitle = element_text(family = "Roboto", 
+              color = "#363c4c", size = 12)
+          )
+
+```

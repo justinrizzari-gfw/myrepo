@@ -1,0 +1,549 @@
+---
+title: "Training Questions"
+author: "Rollan Geronimo"
+date: "9/14/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries, include=FALSE}
+library(bigrquery)
+library(fishwatchr)
+library(dplyr)
+library(countrycode)
+library(kableExtra)
+library(ggplot2)
+library(glue)
+library(tidyverse)
+library(raster)
+library(sf)
+library(kableExtra)
+library(DT)
+
+BQ_connection <-  dbConnect(bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+```
+
+# Transshipment Questions
+
+## 1. How many voyages did Tuna Queen have in 2018 based on a port visit confidence of 4?
+
+Output:
+
+1.  number of voyages
+
+Filters:
+
+1.  ship name = Tuna Queen
+
+2.  year = 2018
+
+3.  port visit confidence = 4
+
+Tables to use:
+
+1.  pipe_production_v20201001.proto_voyages_c4
+
+2.  gfw_research.vi_ssvid_byyear_v20210913
+
+What to do?
+
+1.  Get the ssvid of vessel names "Tuna Queen" in 2018
+
+2.  Get the voyages based on the ssvid of "Tuna Queen" where trip_start \>= '2018-01-01' and trip_end \<= '2018-12-31' (this limits to voyages that started and ended within 2018) \* If we want to include voyages that partially overlap with 2018 (i.e., started before 2018 or ended after 2018), we can use trip_start BETWEEN '2018-01-01' AND '2018-12-31' OR trip_end BETWEEN '2018-01-01' AND '2018-12-31'
+
+```{sql, echo=FALSE, connection=con, output.var = "tunaqueen_mmsi"}
+-- Retrieve SSVID for tuna queen and check other vessel info
+SELECT DISTINCT * FROM (
+    SELECT
+        ssvid,
+        best.best_flag as best_flag,
+        best.best_vessel_class as vessel_class,
+        ais_identity.n_shipname_mostcommon.value AS AIS_shipname_common,
+        a.value as AIS_shipname,
+        registry_info.best_known_shipname AS registry_shipname,
+        year
+    FROM `gfw_research.vi_ssvid_byyear_v20210913`
+    CROSS JOIN unnest (ais_identity.n_shipname) a
+    WHERE
+        year = 2018
+    )
+WHERE 
+    AIS_shipname_common = "TUNAQUEEN" OR 
+    AIS_shipname = "TUNAQUEEN" OR
+    registry_shipname = "TUNAQUEEN"
+
+```
+
+```{sql, echo=FALSE, connection=con, output.var = 'voyages_TunaQueen_c4'}
+-- Based on the sample query: https://github.com/GlobalFishingWatch/bigquery-documentation-wf827/blob/master/queries/examples/current/proto_voyages_and_anchorages_20210730.sql
+
+WITH
+voyages as (
+    SELECT 
+        ssvid,
+        vessel_id,
+        trip_id,
+        trip_start_visit_id,
+        trip_end_visit_id,
+        trip_start,
+        trip_end,
+        trip_start_confidence,
+        trip_end_confidence,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c4`
+    WHERE ssvid = '352894000'
+    AND trip_start <= '2018-12-31' AND trip_end >= '2018-01-01'
+)
+
+SELECT *
+FROM voyages
+ORDER BY trip_start ASC
+
+```
+
+## 2. How does this number change if you restrict the confidence to at least 2 or at least 3 compared to confidence of 4? Why does it change?
+
+```{sql, echo=FALSE, connection=con, output.var = 'voyages_confidence'}
+WITH
+voyages_c2 as (
+    SELECT 
+        ssvid,
+        trip_id,
+        trip_start,
+        trip_end,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c2`
+    WHERE ssvid = '352894000'
+    AND trip_start <= '2018-12-31' AND trip_end >= '2018-01-01'
+),
+
+voyages_c3 as (
+    SELECT 
+        ssvid,
+        trip_id,
+        trip_start,
+        trip_end,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c3`
+    WHERE ssvid = '352894000'
+    AND trip_start <= '2018-12-31' AND trip_end >= '2018-01-01'
+),
+
+voyages_c4 as (
+    SELECT 
+        ssvid,
+        trip_id,
+        trip_start,
+        trip_end,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c4`
+    WHERE ssvid = '352894000'
+    AND trip_start <= '2018-12-31' AND trip_end >= '2018-01-01'
+)
+
+SELECT 
+    DISTINCT 
+    (SELECT COUNT(*) FROM voyages_c2) AS c2_count,
+    (SELECT COUNT(*) FROM voyages_c3) AS c3_count,
+    (SELECT COUNT(*) FROM voyages_c4) AS c4_count
+FROM voyages_c2 as c2,
+     voyages_c3 as c3, 
+     voyages_c4 as c4
+```
+
+```{sql, echo=FALSE, connection=con, output.var = 'voyages_TunaQueen_c2'}
+-- Based on the sample query: https://github.com/GlobalFishingWatch/bigquery-documentation-wf827/blob/master/queries/examples/current/proto_voyages_and_anchorages_20210730.sql
+
+WITH
+voyages as (
+    SELECT 
+        ssvid,
+        vessel_id,
+        trip_id,
+        trip_start,
+        trip_end,
+        trip_start_confidence,
+        trip_end_confidence,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c2`
+    WHERE ssvid = '352894000'
+    AND trip_start <= '2018-12-31' AND trip_end >= '2018-01-01'
+)
+
+SELECT *
+FROM voyages
+ORDER BY trip_start ASC
+```
+
+```{sql, echo=FALSE, connection=con, output.var = 'voyages_TunaQueen_c3'}
+-- Based on the sample query: https://github.com/GlobalFishingWatch/bigquery-documentation-wf827/blob/master/queries/examples/current/proto_voyages_and_anchorages_20210730.sql
+
+WITH
+voyages as (
+    SELECT 
+        ssvid,
+        vessel_id,
+        trip_id,
+        trip_start,
+        trip_end,
+        trip_start_confidence,
+        trip_end_confidence,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c3`
+    WHERE ssvid = '352894000'
+    AND trip_start <= '2018-12-31' AND trip_end >= '2018-01-01'
+)
+
+SELECT *
+FROM voyages
+ORDER BY trip_start ASC
+```
+
+It seems that using either voyages_c2 or voyages_c3 returns the same number of voyages. If we compare voyages_c2 with results from voyages_c4 using the trip_id, we can extract the trip_id values that are different in both tables:
+
+```{r voyages_c3_only, echo=F, warning=F, message=F}
+voyages_c3_only = anti_join(voyages_TunaQueen_c2, voyages_TunaQueen_c3 , by="trip_id")
+```
+
+```{r voyages_c2_only, echo=F, warning=F, message=F}
+voyages_c2_only = anti_join(voyages_TunaQueen_c2, voyages_TunaQueen_c4 , by="trip_id")
+
+```
+
+```{r voyages_c4_only, echo=F, warning=F, message=F}
+voyages_c4_only = anti_join(voyages_TunaQueen_c4, voyages_TunaQueen_c2 , by="trip_id")
+
+```
+
+## 3. How many port events occurred in the port visit associated with the voyage that ended in Zadar on January 20, 2018?
+
+Build on the query from Question 1 but filter only for the voyage that ended on January 20, 2018.
+
+Use additional tables:
+
+1.  pipe_production_v20201001.proto_port_visits (to check port events and port visits)
+2.  anchorages.named_anchorages_v20210503 (to add port labels, based on trip_end_anchorage_id of the proto_voyages_c4 table)
+
+How?
+
+1.  Get the trip_end_visit_id for the voyage of "TUNAQUEEN" where trip_end is '2018-01-20' and the end port is 'ZADAR'
+2.  Match the trip_end_visit_id from the proto_voyages_c3 table to the events.visit_id in the proto_port_visits table and unnest and cross join with events record for the visit_id.
+3.  Join with named_anchorages_v20210503 table to get the port name based on anchorage_id
+
+QUESTIONS (for discussion / Hannah):
+* Why are the anchorage_id for PORT_ENTRY and PORT_EXIT different from PORT_STOP_BEGIN and PORT_STOP_END?
+* What is the "proto_raw_port_events_YYYYMMDD"?
+
+
+```{sql, echo=FALSE, connection=con, output.var = 'port_events'}
+WITH
+-- Get the voyages for Tuna Queen based on the ssvid
+-- limit to where the voyage ended on 2018-01-20
+voyages as (
+    SELECT 
+        ssvid,
+        vessel_id,
+        trip_id,
+        trip_start,
+        trip_end,
+        trip_end_anchorage_id,
+        trip_start_visit_id,
+        trip_end_visit_id,
+        trip_start_confidence,
+        trip_end_confidence,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c3`
+    WHERE ssvid = '352894000'
+    AND trip_end > '2018-01-20 00:00:00' AND
+      trip_end < '2018-01-21 00:00:00'
+),
+
+-- Match trip_end_visit_id with the visit_id in the proto_port_visits table
+port_visits as (
+    SELECT 
+        p.ssvid,
+        p.vessel_id,
+        p.visit_id,
+        e.event_type,
+        e.timestamp,
+        e.anchorage_id
+    FROM `world-fishing-827.pipe_production_v20201001.proto_port_visits` p, voyages v
+    CROSS JOIN UNNEST (events) e
+    WHERE p.visit_id = v.trip_end_visit_id     
+)
+
+-- Add the anchorage label
+SELECT p.*, 
+    a.label as end_anchorage_label
+FROM port_visits p
+LEFT JOIN 
+    (SELECT 
+        s2id, label 
+        FROM `anchorages.named_anchorages_v20210503`) a
+ON p.anchorage_id = a.s2id
+
+
+```
+
+## 4. What is the count of port visits per port based on the end of the voyages in 2018 for Tuna Queen (based on a confidence of 3 and for the 'right' Tuna Queen)?
+
+```{sql, echo=FALSE, connection=con, output.var = 'port_visits_2018'}
+WITH
+-- Get the voyages for Tuna Queen based on the ssvid
+-- limit to where the voyage ended on 2018-01-20
+voyages as (
+    SELECT 
+        ssvid,
+        vessel_id,
+        trip_id,
+        trip_start,
+        trip_end,
+        trip_end_anchorage_id,
+        trip_start_visit_id,
+        trip_end_visit_id,
+        trip_start_confidence,
+        trip_end_confidence,
+        TIMESTAMP_DIFF(trip_end, trip_start, MINUTE)/60/24 voyage_duration_days
+    FROM `pipe_production_v20201001.proto_voyages_c3`
+    WHERE ssvid = '352894000'
+    AND trip_end > '2018-01-01 00:00:00' AND
+      trip_end < '2019-01-01 00:00:00'
+),
+
+-- Match trip_end_visit_id with the visit_id in the proto_port_visits table
+-- Add the anchorage label
+port_visits as (
+    SELECT p.*, 
+    a.label as end_anchorage_label
+    FROM (SELECT 
+                p.ssvid,
+                p.vessel_id,
+                p.visit_id,
+                v.trip_id,
+                v.trip_start,
+                v.trip_end,
+                p.start_anchorage_id,
+                p.end_anchorage_id
+            FROM `world-fishing-827.pipe_production_v20201001.proto_port_visits` p, voyages v
+            WHERE p.visit_id = v.trip_end_visit_id) p
+    LEFT JOIN 
+    (SELECT 
+        s2id, label 
+        FROM `anchorages.named_anchorages_v20210503`) a
+    ON p.end_anchorage_id = a.s2id
+)x
+
+SELECT 
+    ssvid,
+    vessel_id,
+    end_anchorage_label,
+    count(DISTINCT trip_id) AS number_visits
+FROM port_visits
+WHERE vessel_id = "1512ca283-37b5-2737-87b9-047cf0f30433"
+GROUP BY ssvid, vessel_id, end_anchorage_label
+ORDER BY number_visits DESC
+
+```
+
+## 5. What ports were visited after loitering events, that were at least 4 hours and less than or equal to 24 hours, avg 20 nm from shore, and less than 2 knots, by carriers in IOTC in 2020 (based on confidence of 4)? What is the number of port visits at each of these ports?
+
+Output:  
+1.  Port name and number of visits per port
+
+Filters:  
+1. Ports visited after loitering events  
+2. port visit confidence = 4
+3. port visit duration between 4 hours and 24 hours  
+4. Average of 20nm from shore  
+5. speed less than 2 knots  
+6. carriers  
+7. inside IOTC  
+8. year = 2020  
+
+
+Tables to use:  
+1. vessel_database.carrier_vessels_byyear_v20210701  
+2. pipe_production_v20201001.loitering  
+3. ocean_shapefiles_all_purpose.IOTC_shape_feb2021  
+4. pipe_production_v20201001.proto_voyages_c4  
+5. pipe_production_v20201001.proto_port_visits (to check port events and port visits)  
+6. anchorages.named_anchorages_v20210503 (to add port labels, based on trip_end_anchorage_id of the proto_voyages_c4 table)
+
+What to do?  
+1. 
+
+```{sql, echo=FALSE, connection=con, output.var = 'ports_visited_2020'}
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE("2020-01-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE("2020-12-31"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2020 AS INT64));
+--SET loitering minimum duration
+CREATE TEMP FUNCTION min_duration() AS (CAST(4 AS INT64));
+--SET loitering maximum duration
+CREATE TEMP FUNCTION max_duration() AS (CAST(24 AS INT64));
+--SET loitering average distance from shore (nm)
+CREATE TEMP FUNCTION dist_from_shore() AS (CAST(20 AS INT64));
+--SET loitering speed
+CREATE TEMP FUNCTION max_speed() AS (CAST(2 AS INT64));
+----------------------------------
+----------------------------------
+---create curated carrier list
+WITH
+
+carrier_vessels as(
+    SELECT *
+    FROM 
+    vessel_database.carrier_vessels_byyear_v20210701
+    WHERE
+    year = yoi()
+),
+
+loitering as(
+  SELECT
+  *
+  FROM (
+  SELECT
+  vessel_id,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  start_lon,
+  start_lat,
+  end_lon,
+  end_lat,
+   ST_X(centroid) as mean_lon,
+   ST_Y(centroid) as mean_lat
+  FROM(
+  SELECT
+  ssvid as vessel_id,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  start_lon,
+  start_lat,
+  end_lon,
+  end_lat,
+  ST_CENTROID( ST_UNION(ST_GEOGPOINT(start_lon,
+          start_lat),
+        ST_GEOGPOINT(end_lon,
+          end_lat)) ) centroid
+  FROM
+  `pipe_production_v20201001.loitering` 
+  WHERE
+  ssvid IN (select mmsi from carrier_vessels) AND
+DATE(loitering_start_timestamp) >= minimum() 
+  AND DATE(loitering_end_timestamp) <= maximum() 
+  AND avg_distance_from_shore_nm > dist_from_shore() 
+  AND loitering_hours>=min_duration() 
+  AND loitering_hours<=max_duration() 
+  --removes loitering events associated with 'noisey' segment IDs
+  AND
+  seg_id IN (
+  SELECT
+  seg_id
+  FROM
+  `gfw_research.pipe_v20201001_segs`
+  WHERE
+  good_seg
+  AND NOT overlapping_and_short
+  )
+  )
+  GROUP BY
+  vessel_id,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  start_lon,
+  start_lat,
+  end_lon,
+  end_lat,
+  mean_lon,
+  mean_lat
+  )
+  ),
+
+loits_f as(
+  SELECT
+  vessel_id,
+  start_lat,
+  start_lon,
+  end_lat,
+  end_lon,
+  mean_lon,
+  mean_lat,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm
+  FROM (
+  SELECT 
+  *
+  FROM loitering ) a
+  JOIN(
+  SELECT
+  mmsi as carrier_ssvid,
+  year as carrier_year,
+  flag as carrier_flag
+  FROM
+  carrier_vessels ) b
+  ON
+  SAFE_CAST(a.vessel_id as STRING)=SAFE_CAST(b.carrier_ssvid as STRING)
+  AND EXTRACT(YEAR FROM a.loitering_start_timestamp) = b.carrier_year),
+--####
+--add rfmo polygon shapefile of interest
+rfmo as(
+  SELECT
+  st_GeogFromText(string_field_1, make_valid=>TRUE) AS iotc
+  FROM
+  `ocean_shapefiles_all_purpose.IOTC_shape_feb2021`),
+
+--
+--specify that you only when when loitering events are IN IOTC
+--
+--
+--specify that you only when when loitering events are IN IOTC
+--
+
+loits_upd1_a as (
+  SELECT
+  --TO_HEX(MD5(FORMAT("%s|%t", vessel_id, loitering_start_timestamp))) AS loits_id,
+  vessel_id,
+  start_lat,
+  start_lon,
+  end_lat,
+  end_lon,
+  mean_lon,
+  mean_lat,
+  FORMAT("lon:%+07.2f_lat:%+07.2f", ROUND(mean_lon/0.01)*0.01, ROUND(mean_lat/0.01)*0.01) AS gridcode,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm
+  FROM 
+  loits_f, rfmo
+  WHERE ST_CONTAINS(rfmo.iotc, ST_GEOGPOINT(mean_lon, mean_lat))),
+  
+  
+```

@@ -1,0 +1,595 @@
+---
+title: "Training Questions"
+author: "Rollan Geronimo"
+date: "8/11/2021"
+output: 
+  bookdown::html_document2: 
+    toc: true
+    code_folding: hide
+    toc_depth: 2.0
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries, include=FALSE}
+library(bigrquery)
+library(fishwatchr)
+library(dplyr)
+library(countrycode)
+library(kableExtra)
+library(ggplot2)
+library(glue)
+library(tidyverse)
+library(raster)
+library(sf)
+library(kableExtra)
+library(DT)
+
+BQ_connection <-  dbConnect(bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+```
+# Vessel Track Questions
+
+## Raw vessel tracks
+
+**1. Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 without any filters to ‘clean’ the data. **
+
+```{r tracksRaw, echo=F, message=F, warning=F}
+ssvid = '352894000'
+dateRange <- c("2017-10-24","2017-11-06")
+
+query_noisyTrack <- glue::glue(
+  "SELECT 
+    ssvid,
+    lon,
+    lat,
+    timestamp,
+    speed_knots,
+    -1 * elevation_m AS depth_m,
+    distance_from_shore_m/1000 AS distance_from_shore_km,
+    nnet_score,
+    seg_id
+    FROM
+    `gfw_research.pipe_v20201001` 
+    WHERE
+    ssvid = '{ssvid}' AND
+    _partitiontime BETWEEN TIMESTAMP('{dateRange[1]}') AND TIMESTAMP('{dateRange[2]}')
+    ORDER BY timestamp"
+)
+
+vesselTracks_raw <- gfw_query(query = query_noisyTrack, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+
+fishing_track_review(track_df = vesselTracks_raw,
+                     color_fishing = FALSE, # the vessel is a carrier, not a fishing vessel
+                     globe_location = 'lowerright',
+                     theme='dark',
+                     time_series_labels = c("speed_knots","depth_m"),
+                     vessel_name = 'TUNA QUEEN') # vessel name obtained by looking up the MMSI in the Global Fishing Watch public map
+
+# vesselTracks_raw %>% arrange(timestamp) %>% st_as_sf(coords = c("lon","lat"), crs=CRS("+init=epsg:4326")) %>%
+#   mutate(distance_km = c(0,st_distance(.[-1,],.[-nrow(.),],by_element=TRUE)/1000)) %>% data.frame()
+
+```
+
+## Wonky segments
+
+**2. Based on what you are seeing, investigate the connection between, ssvid, vessel id, and seg_id during the time the track seems to make less sense using tables `pipe_production_v20201001.segment_info` and `world-fishing-827.gfw_research.pipe_v20201001_segs`. Can you identify what is occurring in the data to cause the wonky tracks?**
+
+
+First, let's check which parts of the tracks are problematic. The default fishwatchr fishing_track_review function does not have an option to overlay the points so we cannot see easily which segments are problematic. Plotting the points using ggplot() clearly shows the jump in AIS messages and the problematic segments. 
+
+``` {r wonkyTracksPoints, echo=FALSE, message = F, warning = F}
+vesselTracks_raw %>% arrange(timestamp) %>% 
+  ggplot() +
+  geom_point(aes(x=lon,y=lat,col=seg_id))
+```
+
+The track is composed of four unique seg_id (Table \@ref(tab:segmentCounts)). We observe the following:
+
+  + *352894000-2017-08-26T13:58:59.000000Z* and *352894000-2017-10-31T13:03:13.000000Z* are the major segments with the most number of points
+  + *352894000-2017-10-27T03:15:10.000000Z* overlaps in time with the segment *352894000-2017-08-26T13:58:59.000000Z*
+  + *352894000-2017-10-30T08:58:46.000000Z* starts 2.8 days later than the preceding segment *352894000-2017-08-26T13:58:59.000000Z*
+  
+``` {r segmentCounts, echo=FALSE, message = F, warning = F}
+segments <- vesselTracks_raw %>% group_by(seg_id) %>% summarize(n_points = length(seg_id), start_timestamp = min(timestamp), end_timestamp = max(timestamp))
+
+segments %>%
+  kable(caption = sprintf("Summary of segments in the track for MMSI %s",ssvid)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+Let's pull out more information about the segments from the *pipe_production_v20201001.segment_info* table (Table \@ref(tab:segInfo)). It looks like the same SSVID / MMSI corresponds to two different vessels ("TUNA QUEEN" and "ANELLY") with different names, callsign, and imo. 
+
+``` {r segInfo, echo=FALSE, message = F, warning = F}
+query_segInfo<- glue_sql("
+  SELECT 
+  ssvid,
+  vessel_id,
+  seg_id,
+  first_timestamp,
+  last_timestamp,
+  noise,
+  shipname.value AS shipname,
+  callsign.value AS callsign,
+  imo.value AS imo
+   FROM `world-fishing-827.pipe_production_v20201001.segment_info`
+   WHERE 
+   ssvid = {ssvid}
+   AND
+   seg_id IN ({segments$seg_id*})
+", .con = con)
+
+vesselTracks_segInfo <- gfw_query(query = query_segInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselTracks_segInfo <- vesselTracks_segInfo %>% merge(segments[c("seg_id","n_points")], by="seg_id")
+
+vesselTracks_segInfo %>%
+  kable(caption = "Segment information derived from pipe_production_v20201001.segment_info table") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+
+## Cleaned tracks
+
+**3. Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 again but removing noise. **
+
+The noisy segments could be removed by filtering the *gfw_research.pipe_v20201001* with:
+
+  + good_seg IS TRUE
+  + overlapping_and_short IS FALSE
+from the *gfw_research.pipe_v20201001_segs* table.
+
+The clean tracks for the vessel with MMSI `r ssvid` is shown below. 
+  
+``` {r tracksClean, echo=FALSE, message = F, warning = F}
+vessel_track_query_cleaned <- glue::glue(
+  "SELECT 
+    ssvid,
+    lon,
+    lat,
+    timestamp,
+    speed_knots, 
+    -1 * elevation_m AS depth_m,
+    distance_from_shore_m/1000 AS distance_from_shore_km,
+    nnet_score
+    FROM
+    `gfw_research.pipe_v20201001` 
+    WHERE seg_id IN (
+    SELECT seg_id 
+    FROM `gfw_research.pipe_v20201001_segs` 
+    WHERE 
+    overlapping_and_short IS FALSE AND 
+    good_seg IS TRUE) AND
+    ssvid = '{ssvid}' AND
+    _partitiontime BETWEEN TIMESTAMP('{dateRange[1]}') AND TIMESTAMP('{dateRange[2]}') AND
+    nnet_score IS NOT NULL
+    ORDER BY timestamp"
+)
+
+vesselTracks_clean <- gfw_query(query = vessel_track_query_cleaned, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+
+fishing_track_review(track_df = vesselTracks_clean,
+                     color_fishing = FALSE, # the vessel is a carrier, not a fishing vessel
+                     globe_location = 'lowerright',
+                     theme='dark',
+                     time_series_labels = NA,
+                     vessel_name = 'TUNA QUEEN') 
+
+```
+
+# Vessel Info Questions
+
+## Vessel info query
+**1.	What is the name, callsign, flag state, and imo of the vessel with mmsi  353154000 during 2018?**
+
+In 2018, the vessel with MMSI of 353154000 had different registry and AIS names ("KINGBEANS" vs. "CABO DE PALOS"), callsign ("3FKO6" vs. "HP5179"), and imo ("9550151" vs. "7363700"). Both the registry information and AIS indiate the same flag state: Panama.
+
+```{r vesselInfo_Q1, echo = FALSE, message = FALSE, warning = FALSE}
+
+ssvid = '353154000'
+year = 2018
+
+query_vesselInfo<- glue::glue("
+  SELECT 
+  ssvid AS mmsi,
+  year AS year,
+  registry_info.best_known_shipname AS registry_name,
+  ais_identity.shipname_mostcommon.value AS ais_name,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo,
+  best.best_vessel_class AS vessel_class
+  FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+   WHERE 
+   ssvid = '{ssvid}'
+   AND
+   year = {year}
+")
+
+
+vesselInfo <- gfw_query(query = query_vesselInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselInfo %>%
+  kable(caption = sprintf("Vessel information for %s for year %s",ssvid,year)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+## Pulling from different tables
+
+**2.	Is the above answer different if you pull from the vessel info table (gfw_research.vi_ssvid_v) versus the vessel registry table (vessel_database.all_vessels_v)?**
+
+*The two tables, "gfw_research.vi_ssvid_v" and "vessel_database.all_vessels_v", does not have a "year" field.*
+*There are multiple returns for vessel_database.all_vessels_v versus the gfw_research.vi_ssvid_v query.*
+
+
+```{r vesselInfo_Q2a, echo = FALSE, message = FALSE, warning = FALSE}
+query_vesselInfo_vi <- glue::glue("
+  SELECT 
+  ssvid AS mmsi,
+  registry_info.best_known_shipname AS registry_name,
+  ais_identity.shipname_mostcommon.value AS ais_name,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo
+  FROM `world-fishing-827.gfw_research.vi_ssvid_v20210706`
+   WHERE 
+   ssvid = '{ssvid}'
+")
+
+vesselInfo_vi <- gfw_query(query = query_vesselInfo_vi, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselInfo_vi %>%
+  kable(caption = sprintf("Vessel information for %s for year %s from gfw_research.vi_ssvid_v20210706",ssvid,year)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+```{r vesselInfo_Q2b, echo = FALSE, message = FALSE, warning = FALSE}
+query_vesselInfo_allVessels <- glue::glue("
+  SELECT 
+  identity.ssvid AS mmsi,
+  identity.n_shipname AS name,
+  identity.n_callsign AS callsign,
+  identity.flag AS flag,
+  identity.imo AS imo
+  FROM `world-fishing-827.vessel_database.all_vessels_v20210601`
+   WHERE 
+   identity.ssvid = '{ssvid}'
+")
+
+vesselInfo_allVessels <- gfw_query(query = query_vesselInfo_allVessels, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselInfo_allVessels %>%
+  kable(caption = sprintf("Vessel information for %s for year %s from vessel_database.all_vessels_v20210601",ssvid,year)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+## Using vi_ssvid_byyear_v
+
+**3.	Should you use gfw_research.vi_ssvid_v or gfw_research.vi_ssvid_byyear_v to answer question 1 in the vessel info section?**
+
+*Since question 1 asks for the vessel identity for a specific year (i.e., 2018), the "gfw_research.vi_ssvid_byyear_v" table should be used. Vessel identity details could change over time and "gfw_research.vi_ssvid_v" contains the most common identity values.*
+
+## Carrier vessel?
+
+**4.	Is the vessel considered a ‘carrier’? **
+
+No. Based on the table "gfw_research.vi_ssvid_byyear_v20210706", the best vessel classification for the given mmsi is "cargo".
+
+## Fishing vessel?
+
+**5.	Is the vessel a fishing vessel? What are different ways you could determine if the vessel was a fishing vessel? **
+
+No. It is not a fishing vessel.  The ways to determine if the vessel was a fishing vessel are:
+
++ from vi_ssvid_byyear_vYYYYMMDD: 
+  + on_fishing_list_known - Listed as a fishing vessel on 1+ registries
+  + on_fishing_list_sr - Consistently self reports as fishing in AIS messages >98% of messages; minimum 50 positions
+  + on_fishing_list_nn - The neural net believes the vessel is more likely a fishing vessel than a non-fishing vessel combined neural net score for fishing classes > 0.5
+  + on_fishing_list_best
++ check if the ssvid is in the fishing_vessels_ssvid_vYYYYMMDD table
+
+## Vessel class
+
+**6.	What is considered based on the best vessel class? Does this differ from what it is considered when looking at vessel_database.all_vessels_v?**
+
+*Best vessel class considers information from vessel registries, AIS activity, and inferred from the GFW neural net results. The vessel_database.all_vessels_v contains information only from vessel registries.*
+
+## RFMO authority
+
+**7.	Was the vessel ‘authorized’ by any RFMO during 2018? If so, which ones and what are the registry periods?**
+
+*Yes. The vessel was authorized during 2018 by ICCAT.*
+
+```{r vesselInfo_Q7, echo = FALSE, message = FALSE, warning = FALSE}
+
+query_regInfo <- glue::glue("
+  SELECT 
+  identity.ssvid AS mmsi,
+  identity.n_shipname AS name,
+  identity.n_callsign AS callsign,
+  identity.flag AS flag,
+  identity.imo AS imo,
+  registry.authorized_from,
+  registry.authorized_to,
+  registry.list_uvi,
+  FROM `world-fishing-827.vessel_database.all_vessels_v20210601`,
+    UNNEST(registry) AS registry
+    WHERE 
+    identity.ssvid = '{ssvid}'
+")
+
+regInfo <- gfw_query(query = query_regInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+datatable(regInfo, caption = sprintf("Registry information for %s for year %s from vessel_database.all_vessels_v20210601",ssvid,year)) 
+```
+
+
+# Fishing Inspection Questions
+
+## Fishing track and points plot
+**1.	We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?**
+
+There are tracks labelled as apparent fishing but looks like non-fishing (e.g., cruising / transiting) patterns. 
+
+```{r fishingInspection_Q1, echo = FALSE, message = FALSE, warning = FALSE}
+
+ssvid = '367650000'
+dateRange <- c("2017-03-01","2017-03-05")
+
+# ssvid = '417000121'
+# dateRange <- c("2020-01-01", "2020-12-31")
+query_Tracks <- glue::glue(
+  " SELECT
+    ssvid,
+    seg_id,
+    lon,
+    lat,
+    hours,
+    timestamp,
+    nnet_score
+    FROM
+    `gfw_research.pipe_v20201001_fishing` 
+    WHERE seg_id IN (
+      SELECT seg_id 
+      FROM `gfw_research.pipe_v20201001_segs` 
+      WHERE 
+      overlapping_and_short IS FALSE AND 
+      good_seg IS TRUE) AND
+    ssvid = '{ssvid}' AND
+    _partitiontime >= TIMESTAMP('{dateRange[1]}') AND 
+    _partitiontime <= TIMESTAMP('{dateRange[2]}') AND
+    # Should we include nnet_scores that are NULL?
+    nnet_score IS NOT NULL 
+    ORDER BY timestamp"
+)
+
+vTracks <- gfw_query(query = query_Tracks, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+plot_vessel_track_fish(
+  vTracks,
+  bounding_box_man = NA,
+  color_fishing = TRUE,
+  color_by = "nnet_score",
+  map_res = 10,
+  theme = "light",
+  buffer = 2,
+  add_gridlines = TRUE,
+  gfw_proj_name = "Equal Earth",
+  vessel_name = "Alaska Endeavor" # name obtained by searching for the MMSI in the GFW map
+)
+
+# # This is another way to plot the tracks
+# land_sf <- rnaturalearth::ne_countries(scale = 10, returnclass = 'sf')
+# plot_vessel_track(
+#   vTracks,
+#   lat = "lat",
+#   lon = "lon",
+#   show_fishing = TRUE,
+#   spatial = TRUE
+# )
+
+```
+
+
+**2.	How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?**
+
+The proto_events_fishing table will give a slightly restrictive fishing (based on consistency and duration filter).
+
+```{r fishingInspection_Q2, echo = FALSE, message = FALSE, warning = FALSE}
+q_events <- glue::glue(
+  " SELECT
+    SUM(IF(event_type = 'fishing', 
+     TIMESTAMP_DIFF(event_end, event_start, MINUTE),
+     0))/60 AS fishing_hours
+    FROM
+    `pipe_production_v20201001.proto_events_fishing` 
+    WHERE
+    event_start BETWEEN TIMESTAMP('{dateRange[1]}') AND TIMESTAMP('{dateRange[2]}') 
+    AND
+    seg_id LIKE '{ssvid}-%' # But seg_id does not always rely only on ssvid. It can sometimes be imo. 
+    "
+) # better to get the seg_id and match with the seg_id in the proto table
+
+# "Fishing hours" not exactly interpreted as gear-in-the-water time but more broadly in terms of vessel behavior that appears as fishing operations.
+# GFW map now uses proto_fishing_events instead of pipe_fishing 
+# Can use proto_fishing_events for single vessel analysis
+# Use fishing days but put note on what is counted as 'fishing day'
+# JSON_EXTRACT_SCALAR(event_vessels,"$[0].ssvid") as ssvid
+
+events_hours <- gfw_query(query = q_events, 
+                          run_query = TRUE, 
+                          con = con)$data
+```
+
+The total fishing hours is `r round(sum(vTracks[vTracks$nnet_score == 1, "hours"]))` out of `r round(sum(vTracks$hours))` total voyage hours using the *'gfw_research.pipe_v20201001_fishing'* table. 
+
+The total fishing hours using the *'pipe_production_v20201001.proto_events_fishing'* is round(`r events_hours`).
+
+
+**3.	What type of fishing vessel is it?**
+
+It is a trawler. 
+
+```{r fishingInspection_Q3, echo = FALSE, message = FALSE, warning = FALSE}
+q_vesselClass <- glue::glue(
+  "SELECT 
+    year, 
+    inferred.inferred_vessel_class AS inferred_class, 
+    registry_info.best_known_vessel_class AS registry_class,
+    best.best_vessel_class AS best_class
+  FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706` 
+  WHERE ssvid = '{ssvid}' AND year = 2017
+   "
+)
+
+v_class <- gfw_query(query = q_vesselClass, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+```
+
+**4.	Provide the other vessel identity information and registry records during this time.**
+
+The vessel identity information can be derived from the vessel_database.all_vessels_v20210701. Registry information is in the vessel info table vi_ssvid_byyear (since we need to get the registry info for the given period). 
+
+
+```{r fishingInspection_Q4, echo = FALSE, message = FALSE, warning = FALSE}
+
+q_vesselInfo <- glue::glue(
+  "SELECT 
+    identity., 
+    inferred.inferred_vessel_class AS inferred_class, 
+    registry_info.best_known_vessel_class AS registry_class,
+    best.best_vessel_class AS best_class
+  FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706` 
+  WHERE ssvid = '{ssvid}' AND year = 2017 
+   "
+)
+ 
+v_info <- gfw_query(query = q_vesselInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+```
+
+**5.	Let’s take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?**
+
+```{r fishingInspection_Q5, echo = FALSE, message = FALSE, warning = FALSE}
+
+
+```
+
+
+# Transshipment Questions
+
+*## 1.	How many encounter events did CHITOSE have with fishing vessels in the first six months of 2021?*
+
+Based on the GFW map, a ship named CHITOSE has MMSI of 5634180000 and is classified as a carrier vessel, flagged for Singapore.
+
+**QUESTION for Hannah: Does the vessel **
+
+```{r transshipment_Q1, echo = FALSE, message = FALSE, warning = FALSE}
+vesselName = 'CHITOSE'
+ssvid = '563418000'
+dateRange <- c("2021-01-01","2021-06-30")
+
+# From slack channel (from Andres) https://globalfishingwatch.slack.com/archives/CB1L7MYA1/p1571843483008100?thread_ts=1571684817.003900&cid=CB1L7MYA1
+
+
+q_encounters <- glue::glue(
+  "WITH
+    encounters AS (
+    SELECT
+    event_id,
+    vessel_id,
+    JSON_EXTRACT(event_vessels,
+    '$.median_distance_km') AS median_distance_km,
+    CAST (event_start AS DATE) event_date,
+    EXTRACT(YEAR FROM event_start) AS year
+    FROM
+    `world-fishing-827.pipe_production_v20201001.published_events_encounters`
+    WHERE
+    DATE(event_start) >= '{dateRange[1]}'
+    AND DATE(event_end) <= '{dateRange[2]}'
+    AND lat_mean < 90
+    AND lat_mean > -90
+    AND lon_mean < 180
+    AND lon_mean > -180),
+  
+  ssvid_map AS (
+    SELECT
+    vessel_id,
+    ssvid
+    FROM
+    `world-fishing-827.pipe_production_v20201001.vessel_info`),
+  
+  encounter_ssvid AS (
+    SELECT * EXCEPT(vessel_id)
+    FROM (
+      SELECT
+      *
+      FROM
+      encounters) a
+    JOIN (
+      SELECT *
+      FROM
+    ssvid_map) b
+    ON a.vessel_id = b.vessel_id)
+    
+  SELECT
+    *
+    FROM
+    encounter_ssvid 
+    WHERE ssvid = '{ssvid}'
+  "
+)
+ 
+chitose_encounters <- gfw_query(query = q_encounters, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+```
+
+*## 2.	Where did Chitose go to port after these encounter events (just list the unique ports)?*
+
+```{r transshipment_Q2, echo = FALSE, message = FALSE, warning = FALSE}
+
+```
+
+*## 3.	How many loitering events by carriers occurred in IOTC in 2020?*
+*## 4.	How many of the carriers from question 3 were authorized by IOTC or CCSBT during the time of their loitering events?*
+*## 5.	Do the results from 1,2,or 3 differ from the values shown in the CVP? If so, why?*
+*## 6.	How many loitering events that don’t overlap with encounters by the same vessel occur by carriers in IOTC in 2020?*
+

@@ -1,0 +1,445 @@
+---
+title: "Training Questions"
+author: "Rollan Geronimo"
+date: "8/25/2021"
+output: 
+  html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries, include=FALSE}
+library(bigrquery)
+library(fishwatchr)
+library(dplyr)
+library(countrycode)
+library(kableExtra)
+library(ggplot2)
+library(glue)
+library(tidyverse)
+library(raster)
+library(sf)
+library(kableExtra)
+library(DT)
+
+BQ_connection <-  dbConnect(bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+```
+
+# Transshipment Questions
+
+*\#\# 1. How many encounter events did CHITOSE have with fishing vessels in the first six months of 2021?*
+
+```{sql, echo=FALSE, connection=con, output.var = 'chitose_encounters'}
+-- From slack channel (from Andres) https://globalfishingwatch.slack.com/archives/CB1L7MYA1/p1571843483008100?thread_ts=1571684817.003900&cid=CB1L7MYA1
+--  and example code from Github: https://github.com/GlobalFishingWatch/bigquery-documentation-wf827/blob/master/queries/examples/current/encounters_1_ssvid_v20200921.sql
+
+WITH
+  -- get encounters table. Unpack information from event_vessels JSON field.
+  encounters AS (
+    SELECT
+      event_id,
+      event_type,
+      vessel_id,
+      event_start,
+      event_end, 
+      JSON_EXTRACT_SCALAR(event_vessels,
+      '$[0].ssvid') AS first_vessel_ssvid,
+      JSON_EXTRACT_SCALAR(event_vessels,
+      '$[0].name') AS first_vessel_name,
+      JSON_EXTRACT_SCALAR(event_vessels,
+      '$[1].ssvid') AS second_vessel_ssvid,
+      JSON_EXTRACT_SCALAR(event_vessels,
+      '$[1].name') AS second_vessel_name,
+      JSON_EXTRACT_SCALAR(event_info,
+      '$.median_distance_km') AS distance_km,
+      CAST (event_start AS DATE) event_date,
+      EXTRACT(YEAR FROM event_start) AS year
+    FROM
+      `world-fishing-827.pipe_production_v20201001.published_events_encounters`
+    WHERE
+      DATE(event_start) >= '2021-01-01'
+      AND DATE(event_end) <= '2021-06-30'
+      AND lat_mean < 90
+      AND lat_mean > -90
+      AND lon_mean < 180
+      AND lon_mean > -180
+    ),
+  
+  --  list of fishing vessel ssvid for joining with the second_vessel_ssvid of encounters table
+  fishing_vessels AS (
+  SELECT 
+    ssvid,
+    year,
+    on_fishing_list_best AS second_vessel_fishing
+    FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+    WHERE year = 2021 AND
+    ssvid = '416005060'
+  )
+  
+  
+  SELECT
+    *
+  FROM
+    encounters e
+  -- Adding the filter below returned NULL when using only JSON_EXTRACT instead of JSON_EXTRACT_SCALAR
+  JOIN
+    fishing_vessels f
+  ON
+    f.ssvid = e.second_vessel_ssvid
+  WHERE 
+    first_vessel_name = 'CHITOSE' AND
+    second_vessel_fishing = TRUE
+
+```
+
+Based on the GFW map, a ship named CHITOSE has MMSI of 5634180000 and is classified as a carrier vessel, flagged for Singapore.
+
+During the first half of 2021, the ship named 'CHITOSE' had 30 encounter events with 27 fishing vessels.
+
+**Question: Are the event records repeated but with the first and second vessels swapped?**
+
+*\#\# 2. Where did Chitose go to port after these encounter events (just list the unique ports)?*
+
+```{sql chitose_ports, echo=F, connection = con}
+SELECT 
+    DISTINCT(JSON_EXTRACT_SCALAR(event_info,'$.start_anchorage.name')) AS port
+FROM 
+`world-fishing-827.pipe_production_v20201001.published_events_port_visits` 
+WHERE 
+    DATE(event_start) >= '2021-01-01'
+    AND DATE(event_end) <= '2021-06-30'
+    AND vessel_id = 'bf272927e-ed20-22e9-4e26-b5e612e0df85'
+    
+```
+
+*\#\# 3. How many loitering events by carriers occurred in IOTC in 2020?*
+
+Since the questions is specifically asking for carriers, I queried carrier_vessels_byyear_v20210701 instead of all_vessels_v20210701.
+
+**QUESTION: What's the difference with using carrier_vessels_byyear_v20210701**
+
+There were 4,370 loitering events by 184 carriers in the IOTC in 2020.
+
+```{sql, echo=F, connection = con, output.var = "iotc_loitering2"}
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE("2020-01-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE("2020-12-31"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2020 AS INT64));
+--SET loitering minimum duration
+CREATE TEMP FUNCTION min_duration() AS (CAST(4 AS INT64));
+--SET loitering maximum duration
+CREATE TEMP FUNCTION max_duration() AS (CAST(24 AS INT64));
+--SET loitering average distance from shore (nm)
+CREATE TEMP FUNCTION dist_from_shore() AS (CAST(20 AS INT64));
+
+WITH 
+
+---NOTE: old standard method to identify carriers, however there is a new yearly table that I will use instead below because it is 
+--more succinct
+
+carrier_vessels as( -- some mmsi can have multiple flags and/or classes
+    SELECT 
+      mmsi
+    FROM 
+    vessel_database.carrier_vessels_byyear_v20210701
+    WHERE
+    year = yoi()
+),
+
+loitering as (
+  SELECT
+    *,
+    ST_X(centroid) AS mean_lon,
+    ST_Y(centroid) AS mean_lat
+    FROM (
+      SELECT 
+        ssvid,
+        TO_HEX(MD5(FORMAT("%s|%t", ssvid, loitering_start_timestamp))) AS loits_id,
+        loitering_start_timestamp as start_time,
+        loitering_end_timestamp as end_time,
+        start_lon,
+        start_lat,
+        end_lon,
+        end_lat, 
+        loitering_hours,
+        avg_distance_from_shore_nm as dist_from_shore,
+        avg_speed_knots as speed,
+        ST_CENTROID(ST_UNION(ST_GEOGPOINT(start_lon, start_lat), ST_GEOGPOINT(end_lon, end_lat))) centroid
+      FROM `pipe_production_v20201001.loitering`
+      WHERE DATE (loitering_start_timestamp) >= minimum()
+      AND DATE (loitering_end_timestamp) <= maximum()
+      AND avg_distance_from_shore_nm > dist_from_shore()
+      AND loitering_hours BETWEEN min_duration() and max_duration()
+      AND ssvid IN (
+                    SELECT mmsi
+                    FROM carrier_vessels
+                  ) 
+      AND seg_id IN (
+    						    SELECT seg_id
+    						    FROM `gfw_research.pipe_v20201001_segs`
+    						    WHERE good_seg
+    							  AND NOT overlapping_and_short
+    						  )
+    )
+),
+
+iotc_shape as (
+  SELECT ST_GEOGFROMTEXT(string_field_1, make_valid=>TRUE) AS iotc
+  FROM `ocean_shapefiles_all_purpose.IOTC_shape_feb2021`
+),
+
+loitering_iotc as (
+  SELECT l.*
+  FROM loitering l, 
+       iotc_shape s
+  WHERE ST_CONTAINS(iotc,
+                ST_GeogPoint(mean_lon,
+                             mean_lat))
+)
+
+SELECT *
+FROM loitering_iotc
+
+  
+```
+
+*\#\# 4. How many of the carriers from question 3 were authorized by IOTC or CCSBT during the time of their loitering events?*
+
+All carriers from question 3 were authorized by either ITOC or CCSBT.
+
+```{sql, echo=F, connection = con, output.var="authorization"}
+---based on loitering_v20200831.sql
+---create curated carrier list
+
+WITH 
+carrier_vessels AS (
+  SELECT
+   mmsi as ssvid,
+   vessel_class
+  FROM
+  `vessel_database.carrier_vessels_byyear_v20210701`
+  WHERE
+  year = 2020
+  ),
+
+-- get loitering segments filtered for 2020 and carrier vessels only
+  loitering AS (
+  SELECT
+    ssvid as ssvid,
+    seg_id,
+    loitering_start_timestamp,
+    loitering_end_timestamp,
+    ST_CENTROID( ST_UNION(ST_GEOGPOINT(start_lon,
+          start_lat),
+        ST_GEOGPOINT(end_lon,
+          end_lat)) ) centroid
+  FROM
+    `gfw_research.loitering_events_v20200205`
+  WHERE
+    seg_id IN (
+    SELECT
+      seg_id
+    FROM
+      gfw_research.pipe_v20201001_segs
+    WHERE
+      good_seg
+      AND NOT overlapping_and_short)
+  AND loitering_start_timestamp >= TIMESTAMP('2020-01-01') 
+  AND loitering_end_timestamp <= TIMESTAMP('2020-12-31')
+  AND ssvid IN (
+    SELECT
+      ssvid
+    FROM
+      carrier_vessels)),
+
+-- get iotc polygon; the query returns an error: ST_GeogFromText failed: Invalid polygon loop: Edge 3142 crosses edge 3144; in loop 1
+-- https://stackoverflow.com/questions/64485528/invalid-polygon-bigquery-while-using-st-geogfromtext?rq=1
+iotc AS (
+  SELECT ST_GEOGFROMTEXT(string_field_1, make_valid=>TRUE) AS geom,
+  FROM `ocean_shapefiles_all_purpose.IOTC_shape_feb2021`),
+
+loitering_in_iotc AS (
+  SELECT * EXCEPT(geom)
+  FROM loitering
+  JOIN iotc 
+  ON ST_INTERSECTS(iotc.geom, loitering.centroid)
+  ),
+
+reg as(
+--####
+SELECT
+  auth_ssvid,
+  auth_shipname,
+  auth_imo,
+  auth_flag,
+  reg,
+  registry_gear
+  FROM(
+    SELECT
+      identity.ssvid as auth_ssvid,
+      shipname as auth_shipname,
+      identity.imo as auth_imo,
+      flag as auth_flag,
+      authorized_to as registry_authorized_to,
+      authorized_from as registry_authorized_from,
+      is_active as registry_active,
+      SAFE_CAST( SPLIT(list_uvi, '-')[OFFSET(0)] AS string) AS reg,
+        scraped,
+        list_uvi,
+      geartype_original as registry_gear,
+      feature_gear,
+      last_modified,
+      first_timestamp,
+      last_timestamp
+    FROM `vessel_database.all_vessels_v20210701`
+    LEFT JOIN UNNEST(registry)
+    LEFT JOIN UNNEST(activity)
+    LEFT JOIN UNNEST(feature.geartype) as feature_gear
+    WHERE  
+    authorized_to>first_timestamp
+    AND authorized_from<last_timestamp
+    AND DATE(authorized_from)<= '2020-12-31'
+    AND DATE(authorized_to)>='2020-01-01')
+  WHERE reg IN ('IOTC','CCSBT')
+  GROUP BY
+    auth_ssvid,
+    auth_shipname,
+    auth_imo,
+    auth_flag,
+    reg,
+    registry_gear)
+
+SELECT
+*  -- I get a "Column reg of type STRUCT cannot be used in SELECT DISTINCT at [103:17] [invalidQuery]" error if I add "reg" in SELECT. WHY?
+FROM loitering_in_iotc
+LEFT JOIN reg ON (loitering_in_iotc.ssvid = reg.auth_ssvid) 
+
+
+```
+
+*\#\# 5. Do the results from 1,2,or 3 differ from the values shown in the CVP? If so, why?*
+
+Mine vs CVP 1. CHITOSE encounters with fishing vessels: 30 encounters vs. 239 encounters 2.
+
+```{r compareTable, echo=F}
+require(pander)
+panderOptions('table.split.table', Inf)
+set.caption("My great data")
+table < "
+| Questions           | My query | CVP |
+|---------------------|----------|-----|
+|CHITOSE encounters   | 
+"
+
+```
+
+*\#\# 6. How many loitering events that don't overlap with encounters by the same vessel occur by carriers in IOTC in 2020?*
+
+
+What are the filters? 
+* carrier vessel encounters
+* region = IOTC
+* year = 2020
+* Number of loitering events by carriers in IOTC in 2020 that are not part of encounter events?
+
+What tables do we need?
+1. pipe_production_v20201001.published_events_encounters --> for encounters data
+2. pipe_production_v20201001.published_events_loitering --> for loitering data
+3. vessel_database.carrier_vessels_byyear_v20210801 --> carrier vessels list
+4. pipe_production_v20201001.vessel_info --> for getting ssvid from vessel_id
+5. ocean_shapefiles_all_purpose.IOTC_shape_feb2021 --> shapefile for IOTC for determining if events are inside it
+
+Final output:
+1. Number of loitering events by carriers that do not overlap with encounter events by the same vessel
+
+Major steps:
+1. Get list of carriers in 2020
+2. Get the encounter events of all carriers in IOTC in 2020
+3. Get the loitering events of all carriers in  IOTC in 2020
+4. Match loitering events with encounter events per carrier
+5. Remove any loitering events that overlaps with encounter events involving the same vessel
+
+```{sql loitering_overlap, echo=F, connection = con}
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE('2020-01-01'));
+
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE('2020-12-31'));
+
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2020 AS INT64));
+
+--SET your area of interest
+CREATE TEMP FUNCTION region() AS 'iotc';
+
+WITH
+-- Get list of carriers in 2020
+carrier_vessels AS (
+  SELECT
+    *
+  FROM `vessel_database.carrier_vessels_byyear_v20210801`
+  WHERE year = yoi()
+),
+
+-- Get IOTC shapefile
+rfmo AS (
+  SELECT st_GeogFromText(string_field_1) AS iotc_polygon
+  FROM `ocean_shapefiles_all_purpose.IOTC_shape_feb2021`
+),
+
+-- Get the encounters events within the time range specified
+encounters AS (
+  SELECT
+    event_id,
+    vessel_id,
+    event_start,
+    event_end,
+    lat_mean,
+    lon_mean,
+    JSON_EXTRACT(event_info,
+    "$.median_distance_km") AS median_distance_km,
+    JSON_EXTRACT(event_info,
+    "$.median_speed_knots") AS median_speed_knots,
+    SPLIT(event_id, ".")[ORDINAL(1)] AS event,
+    CAST (event_start AS DATE) event_date,
+    EXTRACT(YEAR FROM event_start) AS year
+  FROM
+    `pipe_production_v20201001.published_events_encounters`, rfmo
+  WHERE
+    DATE(event_start) >= minimum()
+    AND DATE(event_end) <= maximum()
+    AND ST_CONTAINS(rfmo.iotc, ST_GEOGPOINT(mean_lon,lat_mean)
+),
+
+-- Retrieve the ssvid based on vessel_id since the encounter events are based on vessel_id
+ssvid_map AS (
+  SELECT
+    vessel_id,
+    ssvid
+  FROM
+    `world-fishing-827.pipe_production_v20190502.vessel_info`),
+
+ -- Join the encounters data with the ssvid data on the same vessel_id and event day to ensure correct SSVID
+encounter_ssvid AS (
+  SELECT * EXCEPT(vessel_id)
+  FROM (
+    SELECT
+    *
+    FROM
+    encounters) a
+  JOIN (
+    SELECT *
+    FROM
+    ssvid_map) b
+  ON a.vessel_id = b.vessel_id),
+
+SELECT *
+FROM carrier_vessels
+
+```

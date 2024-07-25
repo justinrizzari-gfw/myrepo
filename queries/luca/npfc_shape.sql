@@ -1,0 +1,1 @@
+SELECT *  FROM `world-fishing-827.ocean_shapefiles_all_purpose.NPFC_shape` 

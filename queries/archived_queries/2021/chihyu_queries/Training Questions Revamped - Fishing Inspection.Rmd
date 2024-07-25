@@ -1,0 +1,343 @@
+---
+title: "Training Questions Revamped by Chih-Yu"
+author: "Chih-Yu Lai"
+date: "11/24/2021"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+##Load libraries
+```{r loadPackages, include = FALSE}
+library(fishwatchr)
+library(dplyr)
+library(sf)
+library(kableExtra)
+library(ggplot2)
+library(glue)
+library(tidyverse)
+library(raster)
+library(DT)
+library(here)
+library(measurements) 
+library(stringr) 
+```
+
+##Connect to BQ
+```{r}
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+```
+
+##Set parameters
+```{r setParameters}
+ssvid = "367650000"
+start_date = "2017-03-01"
+end_date = "2017-03-05" 
+```
+
+
+#Fishing inspection
+
+##1.We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?
+
+```{r, echo=FALSE}
+VesselTracks <- 
+  'WITH
+      ########################################
+      # This subquery identifies good segments
+      good_segments AS (
+      SELECT
+        seg_id
+      FROM
+        `gfw_research.pipe_v20201001_segs`
+      WHERE
+        good_seg
+        AND positions > 10
+        AND NOT overlapping_and_short
+      )
+      ########################################
+  # This subquery fishing query gets all fishing.
+    SELECT
+        ssvid,
+        seg_id,
+        lon,
+        lat,
+        hours,
+        timestamp,
+        nnet_score
+    FROM
+    `gfw_research.pipe_v20201001_fishing` 
+    WHERE 
+    _partitiontime BETWEEN TIMESTAMP("2017-03-01") and TIMESTAMP("2017-03-05")
+    AND ssvid = "367650000"
+    AND seg_id IN (
+          SELECT
+            seg_id
+          FROM
+            good_segments) 
+    AND nnet_score IS NOT NULL 
+    ORDER BY timestamp DESC
+    '
+VesselTracks_df<- DBI::dbGetQuery(con, VesselTracks)
+
+fishing_track_review(track_df = VesselTracks_df,
+                     color_fishing = TRUE,
+                     globe_location = 'upperright',
+                     theme = 'light',
+                     time_series_labels = NA,
+                     vessel_name = 'ALASKA_ENDEAVOR')
+```
+
+```{r}
+table_df <- VesselTracks_df %>% dplyr::select(ssvid,seg_id,lon,lat,timestamp,hours,nnet_score) 
+table_df %>%  arrange(desc(timestamp))%>% datatable(colnames = c("ssvid","seg_id","lat","lon","timestamp","hours","nnet_score"),caption = sprintf("Track table"),options = list(order = list(7, 'desc')))
+```
+
+
+##2.How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?
+A:109.715833333
+```{r}
+FishingHour<-sum(table_df$hours)
+```
+
+```{r, echo=FALSE}
+VesselTracks2 <- 
+  'WITH
+      ########################################
+      # This subquery identifies good segments
+      good_segments AS (
+      SELECT
+        seg_id
+      FROM
+        `gfw_research.pipe_v20201001_segs`
+      WHERE
+        good_seg
+        AND positions > 10
+        AND NOT overlapping_and_short
+      )
+      ########################################
+  # This subquery fishing query gets all fishing.
+    SELECT
+        ssvid,
+        seg_id,
+        lon,
+        lat,
+        hours,
+        timestamp,
+        nnet_score
+    FROM
+    `pipe_production_v20201001.proto_events_fishing` 
+    WHERE 
+    _partitiontime BETWEEN TIMESTAMP("2017-03-01") and TIMESTAMP("2017-03-05")
+    AND ssvid = "367650000"
+    AND seg_id IN (
+          SELECT
+            seg_id
+          FROM
+            good_segments) 
+    AND nnet_score IS NOT NULL 
+    ORDER BY timestamp DESC
+    '
+VesselTracks2_df<- DBI::dbGetQuery(con, VesselTracks2)
+table2_df <- VesselTracks2_df %>% dplyr::select(ssvid,seg_id,lon,lat,timestamp,hours,nnet_score) 
+table2_df %>%  arrange(desc(timestamp))%>% datatable(colnames = c("ssvid","seg_id","lat","lon","timestamp","hours","nnet_score"),caption = sprintf("Track2 table"),options = list(order = list(7, 'desc')))
+FishingHour2<-sum(table2_df$hours)
+```
+
+##3.What type of fishing vessel is it? 
+A: trawlers
+```{r, echo=FALSE}
+VesselType <- 
+  '
+  SELECT
+      ssvid, 
+      ais_identity.n_shipname as n_shipname,
+      ais_identity.n_shipname_mostcommon as shipname,
+      ais_identity.n_callsign as n_callsign,
+      ais_identity.n_callsign_mostcommon as callsign,
+      ais_identity.n_imo as n_imo,
+      ais_identity.n_imo_mostcommon as imo,
+      ais_identity.shiptype as shiptype,
+      inferred.inferred_vessel_class as vessel_class
+  FROM `gfw_research.vi_ssvid_byyear_v20210913` 
+  WHERE year = 2017
+  AND   ssvid = "367650000"
+  '
+VesselType_df<- DBI::dbGetQuery(con, VesselType)
+View(VesselType_df)
+```
+
+##4.Provide the other vessel identity information and registry records during this time.
+A: This vessel had registry records in the NEPAC, REV, and USA in 2017.
+```{r, echo=FALSE}
+VesselIdentity <- 
+  '
+  SELECT
+         *
+  FROM `gfw_research.vi_ssvid_byyear_v20210913` 
+  WHERE year = 2017
+  AND   ssvid = "367650000"
+  '
+VesselIdentity_df<- DBI::dbGetQuery(con, VesselIdentity)
+```
+
+##5.Let’s take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?
+
+```{r, echo=FALSE}
+CHNsj2018 <- 
+  'WITH
+      ########################################
+      # This subquery identifies good segments
+      good_segments AS (
+      SELECT
+        seg_id
+      FROM
+        `gfw_research.pipe_v20201001_segs`
+      WHERE
+        good_seg
+        AND positions > 10
+        AND NOT overlapping_and_short
+      ),
+      
+      ####################################################################
+      # Get the list of active fishing vessels that pass the noise filters
+      fishing_vessels AS (
+      SELECT
+        ssvid,
+        year,
+        best_flag,
+        best_vessel_class
+      FROM 
+        `gfw_research.fishing_vessels_ssvid_v20210706`
+      WHERE 
+        best_flag = "CHN" 
+        AND best_vessel_class = "squid_jigger"
+        AND year = 2018
+      ),
+      
+      ########################################################################
+      # Read in shapefile of npfc
+      npfc AS (
+      SELECT
+            ST_GEOGFROMTEXT(string_field_1) AS polygon
+      FROM
+            `world-fishing-827.ocean_shapefiles_all_purpose.NPFC_shape`
+      ),
+
+      ########################################
+      # This subquery fishing query gets all fishing.
+      fishing as (
+      SELECT
+          ssvid,
+          seg_id,
+          lat,
+          lon,
+          hours,
+          EXTRACT(year FROM timestamp) as year,
+          timestamp,
+          nnet_score,
+          night_loitering
+      FROM
+      `gfw_research.pipe_v20201001_fishing` 
+      WHERE 
+      _partitiontime BETWEEN TIMESTAMP("2018-01-01") and TIMESTAMP("2018-12-31")
+      AND seg_id IN (
+            SELECT
+              seg_id
+            FROM
+              good_segments) 
+      AND nnet_score IS NOT NULL 
+      ORDER BY timestamp DESC
+      ),
+      
+      ###############################################################################
+      # Filter fishing to the list of active fishing vessels in that year within nfpc
+      fishing_filtered AS (
+              SELECT *
+              FROM fishing
+              JOIN fishing_vessels
+              USING(ssvid, year)
+      ),
+      fishing_filtered_in_NFPC AS (
+      SELECT
+        *
+      FROM
+        fishing_filtered
+      WHERE
+      IF
+        (ST_CONTAINS( (
+            SELECT
+              polygon
+            FROM
+              npfc),
+            ST_GEOGPOINT(lon, lat)),
+          TRUE,
+          FALSE)
+      ),
+      ###################################################################################################
+      # Create fishing_hours attribute by using night_loitering as indicator of fishing for squid jiggers
+      fishing_hours_filtered AS (
+      SELECT *,
+          CASE
+            WHEN best_vessel_class = "squid_jigger" and night_loitering = 1 THEN hours
+            WHEN best_vessel_class != "squid_jigger" and nnet_score > 0.5 THEN hours
+            ELSE 0
+          END
+          AS fishing_hours
+      FROM fishing_filtered_in_NFPC
+      ),
+      ###################################################################################
+      # This subquery sums fishing hours and converts coordinates back to decimal degrees
+      fishing_binned AS (
+      SELECT
+        year,
+        FLOOR(lat * 10) / 10 as lat_bin,
+        FLOOR(lon * 10) / 10 as lon_bin,
+        SUM(hours) as hours,
+        SUM(fishing_hours) as fishing_hours
+      FROM fishing_hours_filtered
+      GROUP BY year, lat_bin, lon_bin
+      )
+
+      SELECT *
+      FROM fishing_binned
+    '
+CHNsjs2018_df<- DBI::dbGetQuery(con, CHNsj2018)
+
+
+
+```
+
+
+
+```{r}
+  CSJeffort_df <- CHNsjs2018_df %>% 
+  filter(fishing_hours>0) %>%
+  mutate(lon_bin = ifelse(lon_bin < 0, lon_bin + 360, lon_bin))
+
+  CSJeffort_df%>% 
+  recenter_raster(raster_df = .,
+                  res = 0.1,
+                  x_lab = "lon_bin",
+                  y_lab = "lat_bin",
+                  fill_lab = "fishing_hours",
+                  center = 180,
+                  proj = "+proj=eqearth +lon_0=0 +wktext") %>%
+
+  ggplot() +
+  geom_raster(aes(x = lon_bin,
+                  y = lat_bin,
+                  fill = fishing_hours)) +
+  geom_gfw_land(theme = "light") +
+  labs(title = "Fishing activity by Chinese flagged squid jiggers",subtitle = "2018") +
+  scale_fill_gradientn(colours = gfw_palette("map_effort_dark"),
+                       limits = c(0,100),
+                       oob = scales::squish,
+                       na.value = NA,
+                       name = "Fishing Hours") +
+  labs(fill = "fishing_hours")
+  theme_gfw_map()
+```
+

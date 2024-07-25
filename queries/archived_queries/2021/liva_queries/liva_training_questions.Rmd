@@ -1,0 +1,787 @@
+---
+title: "Analysis Training"
+author: "Liva"
+---
+
+# Setup
+
+```{r message=FALSE}
+
+library(bigrquery)
+library(fishwatchr)
+library(sp)
+library(ggmap)
+library(devtools)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(rgeos)
+library(rgdal)  
+library(grid)
+library(knitr)
+library(tidyverse)
+library(sf)
+library(rnaturalearthhires)
+library(glue)
+library(countrycode)
+
+# Establish connection to BigQuery project
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+
+bigrquery::bq_auth(email = "liva@globalfishingwatch.org")
+
+options(scipen = 20)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+# Vessel Track Questions
+
+## Q: 1.	Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 without any filters to ‘clean’ the data. 
+
+```{r}
+#query: without any filters
+no_filter_track <- 
+"
+  ---SET your timestamp minimum of interest
+CREATE TEMP FUNCTION
+  START_DATE() AS (TIMESTAMP('2017-10-24 00:00:00'));
+  ---SET your timestamp maximum of interest
+CREATE TEMP FUNCTION
+  END_DATE() AS (TIMESTAMP('2017-11-06 23:59:59'));
+SELECT
+  ssvid,
+  timestamp,
+  lat,
+  lon,
+  speed_knots,
+  -1 * elevation_m AS depth_m,
+  distance_from_shore_m/1000 AS distance_from_shore_km,
+  nnet_score
+FROM
+  `world-fishing-827.gfw_research.pipe_v20201001`
+WHERE
+  --- MMSI number of the vessel: in GFW using 'ssvid'
+  ssvid = '352894000' AND
+  --- set time range
+  _partitiontime BETWEEN START_DATE()
+  AND END_DATE()
+ORDER BY
+  timestamp
+"
+
+#get data
+vessel_track <- fishwatchr::gfw_query(query = no_filter_track,
+                              run_query = TRUE,
+                              con = con)$data
+
+#plot
+
+fishing_track_review(track_df = vessel_track,
+                     color_fishing = FALSE,
+                     globe_location = 'lowerright',
+                     theme= 'dark',
+                     time_series_labels = c('lon','lat','speed_knots'),
+                     vessel_name = 'TUNA QUEEN')
+
+
+```
+
+
+## Q: 2. Based on what you are seeing, investigate the connection between, ssvid, vessel id, and seg_id during the time the track seems to make less sense using tables `pipe_production_v20201001.segment_info` and `world-fishing-827.gfw_research.pipe_v20201001_segs`. Can you identify what is occurring in the data to cause the wonky tracks?
+
+A:
+- The inspection result from the table `inpection pipe_production_v20201001.segment_info` found 4 seg_id which shows 2 different  ship name identities: ANELLY and TUNA QUEEN (2017-08-26 to 2017-10-27 the identity shipname is TUNA QUEEN and 2017-10-27 to 2017-10-30 the identity of the shipname is ANELLY then change back to TUNA QUEEN on 2017-10-31 to 2017-11-23). 
+- The inspection result from the table: `world-fishing-827.gfw_research.pipe_v20201001_segs` found overlapping_and_short is TRUE on first_timestamp 2017-10-27 03:15:10 and last_timestamp 2017-10-27 04:15:56. This is the reason why there are noise tracks on different paths with the same MMSI identity.
+
+```{r}
+#query 1: using `pipe_production_v20201001.segment_info`
+
+segment_info_query <- 
+"
+SELECT
+  *
+FROM
+  `world-fishing-827.pipe_production_v20201001.segment_info`
+WHERE
+  ssvid = '352894000'
+  AND first_timestamp <= '2017-11-06'
+  AND last_timestamp >= '2017-10-24'
+ORDER BY
+  first_timestamp
+
+"
+
+#get data
+seg_info_df <- fishwatchr::gfw_query(query = segment_info_query,
+                              run_query = TRUE,
+                              con = con)$data
+View(seg_info_df)
+
+
+################################################################################
+
+#query 2: using `world-fishing-827.gfw_research.pipe_v20201001_segs`
+segs_query <- 
+"
+SELECT
+  ssvid,
+  positions,
+  active_positions,
+  max_lat,
+  min_lat,
+  max_lon,
+  min_lon,
+  avg_lat_lon,
+  first_timestamp,
+  last_timestamp,
+  good_seg,
+  good_seg2,
+  overlapping_and_short
+FROM
+  `world-fishing-827.gfw_research.pipe_v20201001_segs`
+WHERE
+  ssvid = '352894000'
+  AND first_timestamp <= '2017-11-06'
+  AND last_timestamp >= '2017-10-24'
+"
+
+#get data
+segs_df <- fishwatchr::gfw_query(query = segs_query,
+                              run_query = TRUE,
+                              con = con)$data
+View(segs_df)
+```
+
+
+## Q: 3. Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 again but removing noise. 
+
+```{r}
+#query: filters
+filter_track <- 
+"
+  ---SET your timestamp minimum of interest
+CREATE TEMP FUNCTION
+  START_DATE() AS (TIMESTAMP('2017-10-24'));
+  ---SET your timestamp maximum of interest
+CREATE TEMP FUNCTION
+  END_DATE() AS (TIMESTAMP('2017-11-06'));
+SELECT
+  ssvid,
+  timestamp,
+  lat,
+  lon,
+  speed_knots,
+  -1 * elevation_m AS depth_m,
+  distance_from_shore_m/1000 AS distance_from_shore_km,
+  nnet_score
+FROM
+  `world-fishing-827.gfw_research.pipe_v20201001`
+WHERE
+  --- clean data
+  seg_id IN (
+  SELECT
+    seg_id
+  FROM
+   `world-fishing-827.gfw_research.pipe_v20201001_segs`
+  WHERE
+    overlapping_and_short IS FALSE
+    AND good_seg IS TRUE)
+  AND ssvid = '352894000'
+  AND _partitiontime BETWEEN START_DATE()
+  AND END_DATE()
+  AND nnet_score IS NOT NULL
+ORDER BY
+  timestamp
+"
+
+#get data
+vessel_track_clean <- fishwatchr::gfw_query(query = filter_track,
+                              run_query = TRUE,
+                              con = con)$data
+
+#plot
+
+fishing_track_review(track_df = vessel_track_clean,
+                     color_fishing = FALSE,
+                     globe_location = 'lowerright',
+                     theme= 'dark',
+                     time_series_labels = c('lon','lat','speed_knots'),
+                     vessel_name = 'TUNA QUEEN')
+
+```
+
+#Vessel Info Questions
+
+## Q: 1.	What is the name, callsign, flag state, and imo of the vessel with mmsi  353154000 during 2018?
+
+A: I found different name, callsign and imo information on MMSI 353154000 during 2018 from registry and AIS broadcasting.
+- Registry name: KINGBEANS and AIS broadcasting name: CABODEPALOS
+- Registry callsign: 3FKO6 and AIS broadcasting callsign: HP5179
+- Registry imo: 9550151 and AIS broadcasting imo: 7363700
+
+  for the flag state is Panama
+
+```{r}
+#query 
+vessel_info_byyear <-
+"
+SELECT
+  ssvid,
+  year,
+  --- retrieve data from registry_info and ais_identity
+  registry_info.best_known_shipname AS registry_shipname,
+  ais_identity.n_shipname_mostcommon.value AS ais_shipname,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  best.best_flag AS best_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo
+FROM
+  `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913`
+WHERE
+  ssvid = '353154000'
+  AND year = 2018
+  
+"
+
+#get data
+vessel_info_byyear_df <- fishwatchr::gfw_query(query = vessel_info_byyear,
+                              run_query = TRUE,
+                              con = con)$data
+
+View(vessel_info_byyear_df)
+
+```
+
+## Q: 2.	Is the above answer different if you pull from the vessel info table (gfw_research.vi_ssvid_v) versus the vessel registry table (vessel_database.all_vessels_v)?
+
+A: 
+- if we use the vessel info table (gfw_research.vi_ssvid_v) we can't filter by year spesifically. Through this table, the results of vessel information that often appear in the first and last broadcasting periods of AIS broadcasting are obtained with the following results:
+  - registry and AIS broadcasting shipname: KINGBEANS, 
+  - Registry callsign and AIS broadcasting callsign: 3FKO6, 
+  - Registry and AIS broadcasting imo: 9550151, 
+  - flag state: Panama
+*to see more details when the identity change, we can look at vessel_database.all_vessels_v
+
+- if we use the vessel regitry table (vessel_database.all_vessels_v) we get the result of 3 shipnames with MMSI 353154000: KINGBEANS, EVEREST, CABODEPALOS
+through this table we will also know when AIS first appeared and was detected in 2018.
+
+
+
+```{r}
+#table: gfw_research.vi_ssvid_v
+vessel_info <-
+"
+SELECT
+  ssvid,
+  activity.first_timestamp,
+  activity.last_timestamp,
+  --- retrieve data from registry_info and ais_identity
+  registry_info.best_known_shipname AS registry_shipname,
+  ais_identity.n_shipname_mostcommon.value AS ais_shipname,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  best.best_flag AS best_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo
+FROM
+  `world-fishing-827.gfw_research.vi_ssvid_v20210913`
+WHERE
+  ssvid = '353154000'
+  
+"
+
+#get data
+vessel_info_df <- fishwatchr::gfw_query(query = vessel_info,
+                                        run_query = TRUE,
+                                        con = con)$data
+
+View(vessel_info_df)
+
+################################################################################
+
+#table: vessel_database.all_vessels_v
+vessel_database_all <- 
+"
+SELECT
+  matched,
+  identity.ssvid AS ssvid,
+  identity.n_shipname AS shipname,
+  identity.n_callsign AS callsign,
+  identity.imo AS imo,
+  identity.flag AS flag_state,
+  feature.geartype,
+  activity.first_timestamp,
+  activity.last_timestamp
+FROM
+  `world-fishing-827.vessel_database.all_vessels_v20211001`,
+  UNNEST( activity) AS activity
+WHERE
+  identity.ssvid = '353154000'
+  AND matched #Determine whether the record is a match between registry and AIS
+  AND first_timestamp <= '2018-12-31'
+  AND last_timestamp >= '2018-01-01'
+ORDER BY
+  first_timestamp
+
+"
+
+#get data
+vessel_database_all_df <- fishwatchr::gfw_query(query = vessel_database_all,
+                                        run_query = TRUE,
+                                        con = con)$data
+
+View(vessel_database_all_df)
+
+
+```
+
+## 3.	Should you use gfw_research.vi_ssvid_v or gfw_research.vi_ssvid_byyear_v to answer question 1 in the vessel info section?
+
+A: in terms of searching for vessel info in a certain year it is more suitable to use gfw_research.vi_ssvid_byyear_v, if we want to have information about the most common identities when AIS was actively detected and last detected, it might be better to use gfw_research.vi_ssvid_v. however, identity changes may occur over a period of time.
+
+
+
+## 4.	Is the vessel considered a ‘carrier’? 
+
+A: No, based on best_known_vessel_class information from table `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913` this vessel is a Cargo.
+
+
+```{r}
+vessel_class <- 
+"
+SELECT
+  ssvid,
+  --- retrieve data from registry_info and ais_identity
+  registry_info.best_known_shipname AS registry_shipname,
+  ais_identity.n_shipname_mostcommon.value AS ais_shipname,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  best.best_flag AS best_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo,
+  registry_info.best_known_vessel_class,
+  best.best_vessel_class
+FROM
+  `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913`
+WHERE
+  ssvid = '353154000'
+  AND year = 2018
+
+"
+
+
+#get data
+vessel_class_df <- fishwatchr::gfw_query(query = vessel_class,
+                                        run_query = TRUE,
+                                        con = con)$data
+
+View(vessel_class_df)
+
+```
+
+## 5.	Is the vessel a fishing vessel? What are different ways you could determine if the vessel was a fishing vessel? 
+
+A: No, based on on_fishing_list_best information from table `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913` this vessel is not fishing vessel.
+However, based on the AIS message (on_fishing_list_sr) this vessel is a fishing vessel. as well as when checked on the marine traffic the vessel type is trawler. https://www.marinetraffic.com/en/ais/details/ships/shipid:4947083/mmsi:353154000/imo:7363700/vessel:CABO_DE_PALOS
+
+```{r}
+
+Vessel_fishinglist_info <- 
+"
+SELECT
+  ssvid,
+  year,
+  --- retrieve data from registry_info and ais_identity
+  registry_info.best_known_shipname AS registry_shipname,
+  ais_identity.n_shipname_mostcommon.value AS ais_shipname,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  best.best_flag AS best_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo,
+  on_fishing_list_known,
+  on_fishing_list_nn,
+  on_fishing_list_sr,
+  on_fishing_list_best,
+  best.best_vessel_class
+FROM
+  `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913`
+WHERE
+  ssvid = '353154000'
+  AND year = 2018
+"
+
+
+#get data
+vessel_fishinglist_df <- fishwatchr::gfw_query(query = Vessel_fishinglist_info,
+                                        run_query = TRUE,
+                                        con = con)$data
+
+View(vessel_fishinglist_df)
+
+```
+
+## 6.	What is considered based on the best vessel class? Does this differ from what it is considered when looking at vessel_database.all_vessels_v?
+
+
+A: based on the best vessel class is Cargo, while based on vessel_database.all_vessels_v there are two classes, namely Cargo and Supply Vessel with different shipname
+
+```{r}
+
+vessel_class_database_all_vessels <- 
+"
+SELECT
+  identity.ssvid AS ssvid,
+  identity.n_shipname AS shipname,
+  identity.n_callsign AS callsign,
+  identity.imo AS imo,
+  identity.flag AS flag,
+  first_timestamp,
+  last_timestamp,
+  feature.geartype,
+  matched,
+FROM
+  `world-fishing-827.vessel_database.all_vessels_v20211001`,
+  UNNEST (activity)
+WHERE
+  identity.ssvid = '353154000'
+  AND matched #Determine whether the record is a match between registry and AIS
+  AND first_timestamp <= '2018-12-31'
+  AND last_timestamp >= '2018-01-01'
+ORDER BY
+  first_timestamp
+"
+
+#get data
+vessel_class_database_df <- fishwatchr::gfw_query(query = vessel_class_database_all_vessels,
+                                        run_query = TRUE,
+                                        con = con)$data
+
+View(vessel_class_database_df)
+
+```
+
+## 7.	Was the vessel ‘authorized’ by any RFMO during 2018? If so, which ones and what are the registry periods?
+
+A: This vessel was registered in 2018 by ICCAT under the name CABODEPALOS
+*detailed information is in the 'vessel_authorized_df' table below.
+
+```{r}
+
+vessel_authorized <-
+"
+SELECT
+  DISTINCT identity.ssvid AS ssvid,
+  identity.n_shipname AS shipname,
+  identity.n_callsign AS callsign,
+  identity.imo AS imo,
+  identity.flag AS flag,
+  SAFE_CAST( SPLIT(list_uvi, '-')[OFFSET (0)] AS string) AS reg_list_uvi,
+  registry.authorized_from,
+  registry.authorized_to,
+  matched
+FROM
+  `world-fishing-827.vessel_database.all_vessels_v20211001`,
+  UNNEST (registry) AS registry
+WHERE
+  identity.ssvid = '353154000'
+  AND matched #Determine whether the record is a match between registry and AIS
+  AND is_active #Determine whether the vessel was active by AIS during authorized period
+
+"
+
+#get data
+vessel_authorized_df <- fishwatchr::gfw_query(query = vessel_authorized,
+                                        run_query = TRUE,
+                                        con = con)$data
+
+View(vessel_authorized_df)
+
+
+
+```
+
+#Fishing inspection
+
+##1.	We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?
+
+A: There are some positions that are labeled with fishing, but the duration is quite short.
+
+
+##2.	How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?
+
+A: 98.87 fishing hours
+
+```{r}
+fishing_vessel_track <-
+  "
+SELECT
+  ssvid,
+  timestamp,
+  lat,
+  lon,
+  speed_knots,
+  -1 * elevation_m AS depth_m,
+  distance_from_shore_m/1000 AS distance_from_shore_km,
+  nnet_score,
+  IF(nnet_score > 0.5, hours, 0) as fishing_hours
+FROM
+  `world-fishing-827.gfw_research.pipe_v20201001_fishing`
+WHERE
+  --- clean and good segments
+  seg_id IN (
+  SELECT
+    seg_id
+  FROM
+    `world-fishing-827.gfw_research.pipe_v20201001_segs`
+  WHERE
+    overlapping_and_short IS FALSE
+    AND good_seg IS TRUE)
+  AND ssvid = '367650000'
+  AND _partitiontime BETWEEN '2017-03-01' AND '2017-03-05'
+  AND nnet_score IS NOT NULL
+ORDER BY
+  timestamp
+"
+
+#get data
+fishing_vessel_track_df <- fishwatchr::gfw_query(query = fishing_vessel_track,
+                              run_query = TRUE,
+                              con = con)$data
+
+View(fishing_vessel_track_df)
+#plot
+
+fishing_track_review(track_df = fishing_vessel_track_df,
+                     color_fishing = TRUE,
+                     globe_location = 'upperright',
+                     theme= 'dark',
+                     time_series_labels = c('lon','lat','speed_knots'),
+                     vessel_name = 'ALASKA ENDEAVOR')
+#fishing hours
+fishing_hours <- fishing_vessel_track_df  %>%
+  summarize(fh=sum(fishing_hours))
+
+fishing_hours
+```
+
+
+
+##3.	What type of fishing vessel is it? 
+
+A: This vessel is a trawler
+
+
+```{r}
+fishing_vessel_type <-
+  "
+SELECT
+  ssvid,
+  ais_identity.n_shipname_mostcommon.value AS shipname,
+  ais_identity.n_callsign_mostcommon.value AS callsign,
+  best.best_flag AS best_flag,
+  ais_identity.n_imo_mostcommon.value AS imo,
+  best.best_vessel_class,
+  on_fishing_list_known,
+  on_fishing_list_nn,
+  on_fishing_list_sr,
+  on_fishing_list_best
+FROM
+  `world-fishing-827.gfw_research.vi_ssvid_v20210913`
+WHERE
+  ssvid = '367650000'
+"
+
+fishing_vessel_type_df <- fishwatchr::gfw_query(query = fishing_vessel_type,
+                              run_query = TRUE,
+                              con = con)$data
+
+View(fishing_vessel_type_df)
+```
+##4.	Provide the other vessel identity information and registry records during this time.
+
+A: There is no information overlap with registration authorization for the time duration from 2017-03-01 to 2017-03-05.
+
+```{r}
+
+vessel_identity <- 
+  "
+SELECT
+  DISTINCT matched,
+  identity.n_shipname,
+  identity.n_callsign,
+  identity.flag,
+  identity.imo,
+  first_timestamp,
+  last_timestamp,
+  shipname,
+  geartype_original,
+  feature_gear,
+  authorized_from,
+  authorized_to,
+  SAFE_CAST( SPLIT(list_uvi, '-')[OFFSET (0)] AS string) AS reg_list_uvi
+FROM
+  `vessel_database.all_vessels_v20211001`
+LEFT JOIN UNNEST (registry)
+LEFT JOIN UNNEST (activity)
+LEFT JOIN UNNEST ( feature.geartype) AS feature_gear
+WHERE identity.ssvid = '367650000'
+  AND first_timestamp <= '2017-03-05'
+  AND last_timestamp >= '2017-03-01'
+--   AND authorized_to>first_timestamp
+--   AND authorized_from<last_timestamp
+  AND matched #Determine whether the record is a match between registry and AIS
+  AND is_active #Determine whether the vessel was active by AIS during authorized period
+"
+
+
+vessel_identity_df <- fishwatchr::gfw_query(query = vessel_identity,
+                              run_query = TRUE,
+                              con = con)$data
+
+View(vessel_identity_df)
+```
+
+## 5. Let’s take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?
+
+```{r}
+squid_jiggers_fishing <-
+  "
+WITH
+  
+  ###identifies good segments
+  good_segments AS (
+  SELECT
+    seg_id
+  FROM
+    `gfw_research.pipe_v20201001_segs`
+  WHERE
+    good_seg
+    AND positions > 10
+    AND NOT overlapping_and_short),
+
+  ###fishing vessels squid jigger
+  fishing_vessels AS (
+  SELECT
+    ssvid,
+    year,
+    best_vessel_class
+  FROM gfw_research.fishing_vessels_ssvid_v20210913
+  WHERE best_flag = 'CHN'
+  AND best_vessel_class = 'squid_jigger'
+  AND year = 2018
+  ),
+  
+  ###NPFC shapefile
+  npfc AS (
+      SELECT 
+      'NPFC' as rfmo,
+      ST_GEOGFROMTEXT(string_field_1) as wkt
+      FROM `world-fishing-827.ocean_shapefiles_all_purpose.NPFC_shape`
+  ),
+
+  ###get all fishing
+  fishing AS (
+  SELECT
+    ssvid,
+    FLOOR(lat * 10) as lat_bin,
+    FLOOR(lon * 10) as lon_bin,
+    EXTRACT(year FROM _partitiontime) as year,
+    hours,
+    night_loitering,
+    # With squid jiggers, use night_loitering to determine fishing points
+    IF(night_loitering = 1, hours, NULL) as fishing_hours
+  FROM
+    `gfw_research.pipe_v20201001_fishing`, npfc
+  WHERE _partitiontime between '2018-01-01' and '2018-12-31'
+  AND ST_CONTAINS(npfc.wkt, ST_GEOGPOINT(lon, lat))
+  AND ssvid IN (SELECT ssvid FROM fishing_vessels)
+  # Use good_segments
+  AND seg_id IN (
+    SELECT
+      seg_id
+    FROM
+      good_segments)),
+      
+  ###sums fishing hours and converts coordinates back to
+  # decimal degrees
+  fishing_binned AS (
+  SELECT
+    lat_bin / 10 as lat_bin,
+    lon_bin / 10 as lon_bin,
+    SUM(hours) as hours,
+    SUM(fishing_hours) as fishing_hours
+  FROM fishing
+  GROUP BY lat_bin, lon_bin
+  )
+
+###Return fishing data and calculate fishing hours per square kilometer
+SELECT 
+ *,
+ (fishing_hours/(COS(udfs.radians(lat_bin)) * (111/10)  * (111/10))) fishing_hours_sq_km,
+  FROM fishing_binned
+
+"
+
+squid_jiggers_fishing_df <- fishwatchr::gfw_query(query = squid_jiggers_fishing,
+                              run_query = TRUE,
+                              con = con)$data
+
+View(squid_jiggers_fishing_df)
+
+
+```
+```{r}
+squid_jiggers_fishing_df %>% 
+  filter(fishing_hours > 0) %>% 
+  gfw_map() +
+  geom_raster(aes(x = lon_bin,
+                  y = lat_bin,
+                  fill = fishing_hours),
+              hjust = 1,
+              vjust = 1) +
+  scale_fill_gradientn(colors = gfw_palette('map_effort_dark'),
+                     limits = c(0,100),
+                     oob = scales::squish,
+                     na.value = NA) +
+  labs(fill = 'Fishing hours') +
+  theme_gfw_map()
+```
+```{r}
+bounding <- fishwatchr::transform_box(xlim = c(130, -140),
+                          ylim = c(20, 60),
+                          output_crs = '+proj=eqearth +lon_0=180 +wktext')
+
+squid_jiggers_fishing_df %>% 
+  filter(fishing_hours > 0) %>%
+  fishwatchr::recenter_raster(raster_df = .,
+                  res = 0.25,
+                  x_lab = 'lon_bin',
+                  y_lab = 'lat_bin',
+                  fill_lab = 'fishing_hours',
+                  center = 180) %>%
+  ggplot() +
+  geom_raster(aes(x = lon_bin,
+                  y = lat_bin,
+                  fill = fishing_hours)) +
+  fishwatchr::geom_gfw_land(center = 180) +
+  scale_fill_gradientn(colors = fishwatchr::gfw_palette('map_effort_dark'),
+                       limits = c(0,100),
+                       oob = scales::squish,
+                       na.value = NA) +
+  coord_sf(xlim = c(bounding$box_out['xmin'],bounding$box_out['xmax']),
+         ylim = c(bounding$box_out['ymin'],bounding$box_out[['ymax']] )) +
+  labs(fill = 'Fishing hours') +
+  fishwatchr::theme_gfw_map()
+```
+
+

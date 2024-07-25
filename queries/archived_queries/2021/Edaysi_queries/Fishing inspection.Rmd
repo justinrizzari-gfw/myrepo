@@ -1,0 +1,279 @@
+---
+title: "Fishing inspection"
+author: "Edaysi Bucio"
+date: "8/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Establish connection to BigQuery project
+
+```{r}
+con <- DBI::dbConnect(bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+
+#Run this line if you receive an error about your BigQuery credentials
+#bq_auth() 
+
+```
+
+
+
+## Download packages
+```{r}
+devtools::install_github("ropensci/rnaturalearthhires") #If problems isntalling the package, look at this https://github.com/ropensci/rnaturalearthhires/issues/1
+
+#Install fishwatchr
+devtools::install_github("GlobalFishingWatch/fishwatchr")
+library(fishwatchr)
+library(tidyverse)
+library(bigrquery)
+library(ggsci) 
+library(rnaturalearth)
+library(rnaturalearthhires)
+library(sf)
+library(raster)
+library(viridis)
+library(googledrive)
+library(sp)
+library(devtools)
+
+```
+
+
+Fishing inspection
+
+**1. We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?**
+
+```{sql connection = con, output.var = "track_inspection"}
+
+WITH
+vessel AS (
+SELECT
+  *
+FROM (
+  SELECT
+    timestamp,
+    lat,
+    lon,
+    ssvid,
+    seg_id,
+    nnet_score,
+    hours,
+  IF(nnet_score > 0.5, hours,0) fishing_hours
+  FROM
+    `world-fishing-827.gfw_research.pipe_v20201001`
+  WHERE
+    # Select data range for track using date to make query cheaper
+    _partitiontime >= TIMESTAMP("2017-03-01") 
+    AND  _partitiontime <= TIMESTAMP("2017-03-05")
+    # List of MMSI(s) to get tracks for
+    AND ssvid IN ("367650000") )
+# only select points that are part of non-noise segments (good_seg)
+WHERE
+  seg_id IN (
+  SELECT
+    seg_id
+  FROM
+    `gfw_research.pipe_v20201001_segs`
+    WHERE 
+   good_seg = true AND
+        NOT overlapping_and_short)
+  ORDER BY
+  ssvid,
+  timestamp   
+),
+identity AS (
+SELECT
+ssvid,
+activity,
+activity.first_timestamp, 
+activity.last_timestamp,
+ais_identity.n_shipname,
+ais_identity.n_callsign,
+ais_identity.n_imo
+FROM
+   `world-fishing-827.gfw_research.vi_ssvid_v20210706`
+)
+-- Return final data after joining with vessel info
+SELECT 
+*
+FROM 
+vessel
+LEFT JOIN 
+identity
+USING (ssvid)
+ ORDER BY
+timestamp DESC
+  
+
+```
+**1.1 Are there any issues with the track?**
+Answer: I don't see any issues with the track. Looks like there is consistent fishing activity. 
+```{r}
+
+fishing_track_review(track_df = track_inspection,
+                     color_fishing = TRUE,
+                     globe_location = 'upperright',
+                     theme = 'dark',
+                     time_series_labels = NA,
+                     vessel_name = 'ALASKA_ENDEAVOR')
+```
+
+**2. How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?**
+Answer: With gfw_research.pipe_v20201001 there are 98.87. With pipe_production_v20201001.proto_events_fishing` there are X
+
+
+
+**3. What type of fishing vessel is it?**
+Answer: Its a trawler
+```{sql connection = con, output.var = "vessel_type"}
+
+SELECT
+ssvid, 
+ais_identity.n_shipname,
+ais_identity.n_shipname_mostcommon,
+ais_identity.n_callsign,
+ais_identity.n_callsign_mostcommon,
+ais_identity.n_imo,
+ais_identity.n_imo_mostcommon,
+ais_identity.shiptype,
+inferred.inferred_vessel_class
+FROM `world-fishing-827.gfw_research.vi_ssvid_v20210706` 
+WHERE ssvid in  ('367650000') 
+
+```
+```{r}
+View(vessel_type)
+```
+
+
+**4. Provide the other vessel identity information and registry records during this time.**
+Answer: 
+
+- The vessel was broadcasting with the call sign and IMO numbers WDF7174 and 793355550, then with 7DF7174 and 792797470, respectively.
+
+- During 2017, the vessel showed registry records in the NEPAC, REV, and USA. Question: Not sure what REV or USA stands for registry records. 
+
+```{sql connection = con, output.var = "registry_records"}
+SELECT
+*
+FROM gfw_research.vi_ssvid_byyear_v20210706
+WHERE ssvid IN ('367650000')
+AND year = 2017
+
+```
+
+
+**5.Let’s take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?**
+
+````{sql connection = con, output.var = "Chinese_squid"}
+WITH
+-- area of interest NPFC :: polygon to select squid chinese fishing vessels during 2018
+aoi as(
+  SELECT
+  st_GeogFromText(string_field_1, make_valid=>TRUE) AS polygon
+  FROM
+  `world-fishing-827.ocean_shapefiles_all_purpose.NPFC_shape`
+),
+
+
+
+    -- Caclulate daily fishing and non-fishing hours for each vessel in the NPFC AKA Aoi. Note: Probably using the night_loitering for getting squid fishing activity
+  positions AS ( 
+  SELECT   
+  EXTRACT(year from timestamp) AS year,
+    ssvid,
+    lat as latitude,
+    lon as longitude,
+    hours,
+    nnet_score,   
+    FROM
+    `gfw_research.pipe_v20201001_fishing`
+  WHERE
+    _partitiontime BETWEEN TIMESTAMP('2018-01-01') 
+    AND TIMESTAMP('2018-12-31')
+),
+      
+ ssvid_in_aoi AS ( 
+  SELECT
+  * 
+  FROM
+    positions
+  WHERE
+  IF
+    (ST_CONTAINS( (
+        SELECT
+          polygon
+        FROM
+          aoi),
+        ST_GEOGPOINT(longitude,
+          latitude)),
+      TRUE,
+      FALSE)
+),
+-- Bin data and caluclate fishing hours
+fishing_gridded AS (  
+SELECT
+  *,
+  -- Calcultate 10th degree grid cell for each position 
+  floor(latitude * 10) as lat_bin,
+  floor(longitude * 10) as lon_bin,
+  IF(nnet_score > 0.5, hours, 0) as fishing_hours
+  FROM
+  ssvid_in_aoi
+),
+-- Summarize fishing hours by 10th degree lat/lon grid cell
+total_fishing AS (
+SELECT
+  ssvid,
+  year,
+   -- Divide by 10 to convert back to decimal degrees
+  lat_bin / 10 as lat_bin,
+  lon_bin / 10 as lon_bin,
+  SUM(hours) as hours,
+  SUM(fishing_hours) as fishing_hours,
+  COUNT(*) as positions
+FROM fishing_gridded
+GROUP BY ssvid, year, lat_bin, lon_bin
+),
+-- Get vessel info. Note: Here I'm trying to select just infro for vessels flagged to China and squid jiggers
+vessel_info AS (
+SELECT 
+identity.ssvid AS ssvid,
+identity.n_shipname,
+feature.geartype AS squid,
+a.first_timestamp,
+a.last_timestamp,
+identity.flag AS flag,
+FROM `world-fishing-827.vessel_database.all_vessels_v20200101`, UNNEST (activity) AS a
+WHERE ( matched OR loose_match )
+  /* Check whether `geartype` of the vessel is
+  either purse_seiner or tuan_purse_seiner */
+  AND EXISTS (
+    SELECT *
+    FROM UNNEST (feature.geartype) AS x
+    WHERE x IN ("squid_jigger") )
+  AND "other_fishing" NOT IN UNNEST (feature.geartype)
+  AND identity.flag = 'CHN'
+)
+-- Return final data after joining with vessel info
+SELECT 
+    ssvid,
+    lat_bin,
+    lon_bin,
+    hours,
+   fishing_hours,
+   positions,
+   n_shipname,
+   flag,    
+FROM 
+total_fishing
+LEFT JOIN 
+vessel_info
+USING (ssvid)
+
+```
+

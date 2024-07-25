@@ -1,0 +1,813 @@
+---
+title: "Answer queries to training questions (Now Put It Together)"
+author: "Rollan Geronimo"
+date: "10/19/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Will need to install devtools first install.packages(devtools") then library(devtools)
+#devtools::install_github("ropensci/rnaturalearthhires") #If problems isntalling the package, look at this https://github.com/ropensci/rnaturalearthhires/issues/1
+# Install fishwatchr
+#devtools::install_github("GlobalFishingWatch/fishwatchr")
+library(fishwatchr)
+library(tidyverse)
+library(bigrquery)
+library(ggsci) 
+library(rnaturalearth)
+library(rnaturalearthhires)
+library(sf)
+library(raster)
+library(viridis)
+#library(googledrive)
+library(sp)
+```
+
+# Connection to BQ
+
+```{r}
+con <- DBI::dbConnect(bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+#Run this line if you receive an error about your BigQuery credentials
+
+bq_auth()
+```
+
+# Questions (Put it Together)
+
+1.  How many encounters occurred in NPFC between trawlers and carrier vessels in the last three months (July - September 2021)?\
+2.  Which vessels are registered with NPFC during the encounters? And what are the names of the fishing vessels in the encounters?\
+3.  Based on a confidence of 2, where did the carrier vessels enter port after these encounters, specifically how many port visits per port where there? (note: play around with using ssvid vs vessel id to merge the two event types, how does that affect things?)\
+4.  How many total fishing hours did the trawlers have prior to encountering the carrier and after leaving their most recent port visit (based on a confidence of 2)? Which trawler had the most fishing hours prior to an encounter on a single voyage, and how many hours was it?
+
+## 1. How many encounters occurred in NPFC between trawlers and carrier vessels in the last three months (July - September 2021)?
+
+What do we want? filters
+
+-   Encounters
+-   Inside NPFC
+-   By trawlers and carrier vessels
+-   July to September 2021
+
+What tables to use:
+
+-   Vessel info: pipe_production_v20201001.vessel_info
+-   Trawler vessels: gfw_research.vi_ssvid_v20210913
+-   Carrier list: vessel_database.all_vessels_v20210901
+-   Encounters: pipe_production_v20201001.encounters
+-   NPFC shapefile: ocean_shapefiles_all_purpose.NPFC_shape
+-   Segments: gfw_research.pipe_v20201001_segs
+
+ANSWER: I got seven (7) encounters. 
+
+```{sql connection = con, output.var = "npfc_encounters"}
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (TIMESTAMP("2021-07-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (TIMESTAMP("2021-09-30"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2021 AS INT64));
+----------------------------------
+
+WITH
+
+vessel_info AS (
+  SELECT *
+  FROM `pipe_production_v20201001.vessel_info`
+),
+
+-- Get list of trawler vessels active during the timeperiod of interest
+-- Use gfw_research.vi_ssvid_v20210913 since the all_vessels_v table does not have vessel_class information
+trawler_vessels AS (
+  SELECT 
+    ssvid AS trawler_ssvid,
+    ais_identity.n_shipname_mostcommon.value as shipname,
+    ais_identity.n_imo_mostcommon.value as trawler_imo,
+    ais_identity.n_callsign_mostcommon.value as trawler_callsign,
+    best.best_flag as trawler_flag,
+    activity.first_timestamp AS first_timestamp,
+    activity.last_timestamp AS last_timestamp
+  FROM `world-fishing-827.gfw_research.vi_ssvid_v20210913` 
+  WHERE TIMESTAMP(activity.last_timestamp) >= minimum()
+  AND TIMESTAMP(activity.first_timestamp) <= maximum()
+  AND best.best_vessel_class = "trawlers" -- Should I use best.best_vessel_class or inferred.inferred_vessel_class?
+  AND on_fishing_list_best
+),
+
+-- Get vessel_id for trawlers since the Encounters table has vessel_id instead of ssvid
+trawlers_vessel_id AS (
+  SELECT t.*, v.vessel_id, "trawler" as class
+  FROM trawler_vessels t
+  LEFT JOIN 
+    (SELECT
+        ssvid,
+        vessel_id, 
+        last_timestamp, 
+        first_timestamp 
+    FROM vessel_info) v
+  ON t.trawler_ssvid = v.ssvid
+  WHERE TIMESTAMP(v.last_timestamp) >= minimum() -- or should this be compared against t.first_timestamp()?
+  AND TIMESTAMP(v.first_timestamp) <= maximum() -- or should this be compared against t.last_timestamp()?
+),
+
+-- Get list of carrier vessels active during the timeperiod of interest
+carrier_vessels AS (
+  SELECT
+    identity.ssvid AS carrier_ssvid,
+    identity.n_shipname AS shipname,
+    first_timestamp AS first_timestamp,
+    last_timestamp AS last_timestamp
+  FROM
+    `world-fishing-827.vessel_database.all_vessels_v20210901`
+  LEFT JOIN UNNEST(registry)
+  LEFT JOIN UNNEST(activity)
+  --LEFT JOIN UNNEST(feature.geartype) as feature_gear
+  WHERE is_carrier 
+    AND confidence >= 3
+    AND identity.ssvid NOT IN ("111111111","0","888888888","416202700")
+    AND TIMESTAMP(first_timestamp) <= maximum()
+    AND TIMESTAMP(last_timestamp) >= minimum()
+  GROUP BY 1,2,3,4
+),
+
+-- Get vessel_id for carriers since the Encounters table has vessel_id instead of ssvid
+-- the number of distinct carrier_ssvid in the carriers_vessel_id is 1,107 but the 
+-- number of distinct carrier_ssvid in the carrier_vessels is 1,111. Why? It should be equal since we are just appending vessel_id to the carrier_vessels table.
+carriers_vessel_id AS (
+  SELECT c.*, v.vessel_id, "carrier" as class
+  FROM carrier_vessels c
+  LEFT JOIN 
+    (SELECT
+        ssvid,
+        vessel_id, 
+        last_timestamp, 
+        first_timestamp 
+    FROM vessel_info) v
+  ON c.carrier_ssvid = v.ssvid
+  WHERE TIMESTAMP(v.last_timestamp) >= minimum() -- or should this be compared against c.first_timestamp()?
+  AND TIMESTAMP(v.first_timestamp) <= maximum() -- or should this be compared against c.last_timestamp()?
+), 
+
+-- combine trawlers and carrier SSVID with vessel class for joining with encounters
+carrier_trawlers AS (
+  
+  SELECT carrier_ssvid as ssvid, vessel_id, class, first_timestamp, last_timestamp, shipname
+  FROM carriers_vessel_id UNION ALL
+  SELECT trawler_ssvid as ssvid, vessel_id, class, first_timestamp, last_timestamp, shipname
+  FROM trawlers_vessel_id
+  
+),
+
+-- retrieve NPFC polygon
+npfc_shape as (
+  SELECT st_GeogFromText(string_field_1, make_valid=>TRUE) AS npfc
+  FROM `ocean_shapefiles_all_purpose.NPFC_shape`
+),
+
+
+-- extract all encounters inside NPFC during the timeperiod and filtering for minimum duration (2 hours) and minimum median speed (2 knots)
+encounters AS (
+  SELECT
+    SPLIT(event_id, ".")[ORDINAL(1)] AS encounter_id,
+    event_id,
+    vessel_id,
+    event_start,
+    event_end,
+    lat_mean,
+    lon_mean,
+    JSON_EXTRACT(event_info,
+               "$.median_distance_km") AS median_distance_km,
+    JSON_EXTRACT(event_info,
+               "$.median_speed_knots") AS median_speed_knots,
+    SPLIT(event_id, ".")[ORDINAL(1)] AS event,
+    CAST (event_start AS DATE) event_date,
+    EXTRACT(YEAR FROM event_start) AS year
+  FROM
+    `world-fishing-827.pipe_production_v20201001.published_events_encounters`, npfc_shape
+  WHERE TIMESTAMP(event_start) >= minimum()
+   AND TIMESTAMP(event_end) <= maximum()
+   AND lat_mean < 90
+   AND lat_mean > -90
+   AND lon_mean < 180
+   AND lon_mean > -180
+   AND ST_CONTAINS(npfc_shape.npfc, ST_GEOGPOINT(lon_mean,lat_mean))
+),
+
+encounter_ssvid AS (
+ SELECT * EXCEPT(vessel_id)
+  FROM (
+      SELECT *
+      FROM encounters) a
+  JOIN (
+      SELECT *
+      FROM carrier_trawlers) b
+  ON a.vessel_id = b.vessel_id
+),
+
+encounters_carriers AS (
+  SELECT *
+  FROM encounter_ssvid
+  WHERE class = "carrier"
+),
+
+all_encounters as (
+  SELECT
+    encounter_id,
+    event_start,
+    event_end,
+    lat_mean as mean_lat,
+    lon_mean as mean_lon,
+    median_distance_km,
+    median_speed_knots,
+    (TIMESTAMP_DIFF(event_end,event_start,minute)/60) event_duration_hr,
+    event_date,
+    a.ssvid as carrier_ssvid,
+    a.class as carrier_class,
+    a.shipname as carrier_shipname,
+    a.first_timestamp as carrier_first_timestamp,
+    a.last_timestamp as carrier_last_timestamp,
+    b.ssvid as trawler_ssvid,
+    b.class as trawler_class,
+    b.shipname as trawler_shipname,
+    b.first_timestamp as trawler_first_timestamp,
+    b.last_timestamp as trawler_last_timestamp,
+  FROM encounters_carriers a
+  JOIN (
+    SELECT
+      encounter_id,
+      ssvid,
+      class,
+      shipname,
+      first_timestamp,
+      last_timestamp
+    FROM encounter_ssvid
+    WHERE class = "trawler") b
+  USING (encounter_id)
+  WHERE a.ssvid != b.ssvid
+  GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19)
+
+SELECT * FROM all_encounters
+
+```
+
+
+## 2.  Which vessels are registered with NPFC during the encounters? And what are the names of the fishing vessels in the encounters?
+
+What do we want? 
+
+-   fishing vessels authorized by NPFC during the encounters
+-   names of fishing vessels in the encounters
+
+What tables to use (in addition to what's in Question 1):
+
+-   Authorization info from: vessel_database.all_vessels_v20210901
+
+
+```{sql connection = con, output.var = "vesselReg"}
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (TIMESTAMP("2021-07-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (TIMESTAMP("2021-09-30"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2021 AS INT64));
+----------------------------------
+
+WITH
+
+vessel_info AS (
+  SELECT *
+  FROM `pipe_production_v20201001.vessel_info`
+),
+
+-- Get list of trawler vessels active during the timeperiod of interest
+-- Use gfw_research.vi_ssvid_v20210913 since the all_vessels_v table does not have vessel_class information
+trawler_vessels AS (
+  SELECT 
+    ssvid AS trawler_ssvid,
+    ais_identity.n_shipname_mostcommon.value as shipname,
+    ais_identity.n_imo_mostcommon.value as trawler_imo,
+    ais_identity.n_callsign_mostcommon.value as trawler_callsign,
+    best.best_flag as trawler_flag,
+    activity.first_timestamp AS first_timestamp,
+    activity.last_timestamp AS last_timestamp
+  FROM `world-fishing-827.gfw_research.vi_ssvid_v20210913` 
+  WHERE TIMESTAMP(activity.last_timestamp) >= minimum()
+  AND TIMESTAMP(activity.first_timestamp) <= maximum()
+  AND best.best_vessel_class = "trawlers" -- Should I use best.best_vessel_class or inferred.inferred_vessel_class?
+  AND on_fishing_list_best
+),
+
+-- Get vessel_id for trawlers since the Encounters table has vessel_id instead of ssvid
+trawlers_vessel_id AS (
+  SELECT t.*, v.vessel_id, "trawler" as class
+  FROM trawler_vessels t
+  LEFT JOIN 
+    (SELECT
+        ssvid,
+        vessel_id, 
+        last_timestamp, 
+        first_timestamp 
+    FROM vessel_info) v
+  ON t.trawler_ssvid = v.ssvid
+  WHERE TIMESTAMP(v.last_timestamp) >= minimum() -- or should this be compared against t.first_timestamp()?
+  AND TIMESTAMP(v.first_timestamp) <= maximum() -- or should this be compared against t.last_timestamp()?
+),
+
+-- Get list of carrier vessels active during the timeperiod of interest
+carrier_vessels AS (
+  SELECT
+    identity.ssvid AS carrier_ssvid,
+    identity.n_shipname AS shipname,
+    first_timestamp AS first_timestamp,
+    last_timestamp AS last_timestamp
+  FROM
+    `world-fishing-827.vessel_database.all_vessels_v20210901`
+  LEFT JOIN UNNEST(registry)
+  LEFT JOIN UNNEST(activity)
+  --LEFT JOIN UNNEST(feature.geartype) as feature_gear
+  WHERE is_carrier 
+    AND confidence >= 3
+    AND identity.ssvid NOT IN ("111111111","0","888888888","416202700")
+    AND TIMESTAMP(first_timestamp) <= maximum()
+    AND TIMESTAMP(last_timestamp) >= minimum()
+  GROUP BY 1,2,3,4
+),
+
+-- Get vessel_id for carriers since the Encounters table has vessel_id instead of ssvid
+-- the number of distinct carrier_ssvid in the carriers_vessel_id is 1,107 but the 
+-- number of distinct carrier_ssvid in the carrier_vessels is 1,111. Why? It should be equal since we are just appending vessel_id to the carrier_vessels table.
+carriers_vessel_id AS (
+  SELECT c.*, v.vessel_id, "carrier" as class
+  FROM carrier_vessels c
+  LEFT JOIN 
+    (SELECT
+        ssvid,
+        vessel_id, 
+        last_timestamp, 
+        first_timestamp 
+    FROM vessel_info) v
+  ON c.carrier_ssvid = v.ssvid
+  WHERE TIMESTAMP(v.last_timestamp) >= minimum() -- or should this be compared against c.first_timestamp()?
+  AND TIMESTAMP(v.first_timestamp) <= maximum() -- or should this be compared against c.last_timestamp()?
+), 
+
+-- combine trawlers and carrier SSVID with vessel class for joining with encounters
+carrier_trawlers AS (
+  
+  SELECT carrier_ssvid as ssvid, vessel_id, class, first_timestamp, last_timestamp, shipname
+  FROM carriers_vessel_id UNION ALL
+  SELECT trawler_ssvid as ssvid, vessel_id, class, first_timestamp, last_timestamp, shipname
+  FROM trawlers_vessel_id
+  
+),
+
+-- retrieve NPFC polygon
+npfc_shape as (
+  SELECT st_GeogFromText(string_field_1, make_valid=>TRUE) AS npfc
+  FROM `ocean_shapefiles_all_purpose.NPFC_shape`
+),
+
+
+-- extract all encounters inside NPFC during the timeperiod and filtering for minimum duration (2 hours) and minimum median speed (2 knots)
+encounters AS (
+  SELECT
+    SPLIT(event_id, ".")[ORDINAL(1)] AS encounter_id,
+    event_id,
+    vessel_id,
+    event_start,
+    event_end,
+    lat_mean,
+    lon_mean,
+    JSON_EXTRACT(event_info,
+               "$.median_distance_km") AS median_distance_km,
+    JSON_EXTRACT(event_info,
+               "$.median_speed_knots") AS median_speed_knots,
+    SPLIT(event_id, ".")[ORDINAL(1)] AS event,
+    CAST (event_start AS DATE) event_date,
+    EXTRACT(YEAR FROM event_start) AS year
+  FROM
+    `world-fishing-827.pipe_production_v20201001.published_events_encounters`, npfc_shape
+  WHERE TIMESTAMP(event_start) >= minimum()
+   AND TIMESTAMP(event_end) <= maximum()
+   AND lat_mean < 90
+   AND lat_mean > -90
+   AND lon_mean < 180
+   AND lon_mean > -180
+   AND ST_CONTAINS(npfc_shape.npfc, ST_GEOGPOINT(lon_mean,lat_mean))
+),
+
+encounter_ssvid AS (
+ SELECT * EXCEPT(vessel_id)
+  FROM (
+      SELECT *
+      FROM encounters) a
+  JOIN (
+      SELECT *
+      FROM carrier_trawlers) b
+  ON a.vessel_id = b.vessel_id
+),
+
+encounters_carriers AS (
+  SELECT *
+  FROM encounter_ssvid
+  WHERE class = "carrier"
+),
+
+all_encounters as (
+  SELECT
+    encounter_id,
+    event_start,
+    event_end,
+    lat_mean as mean_lat,
+    lon_mean as mean_lon,
+    median_distance_km,
+    median_speed_knots,
+    (TIMESTAMP_DIFF(event_end,event_start,minute)/60) event_duration_hr,
+    event_date,
+    a.ssvid as carrier_ssvid,
+    a.class as carrier_class,
+    a.shipname as carrier_shipname,
+    a.first_timestamp as carrier_first_timestamp,
+    a.last_timestamp as carrier_last_timestamp,
+    b.ssvid as trawler_ssvid,
+    b.class as trawler_class,
+    b.shipname as trawler_shipname,
+    b.first_timestamp as trawler_first_timestamp,
+    b.last_timestamp as trawler_last_timestamp,
+  FROM encounters_carriers a
+  JOIN (
+    SELECT
+      encounter_id,
+      ssvid,
+      class,
+      shipname,
+      first_timestamp,
+      last_timestamp
+    FROM encounter_ssvid
+    WHERE class = "trawler") b
+  USING (encounter_id)
+  WHERE a.ssvid != b.ssvid
+  GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19),
+
+init_npfc_auth as ( 
+  SELECT *
+  FROM (
+      SELECT
+        identity.ssvid as auth_ssvid,
+        identity.n_shipname as auth_shipname,
+        identity.imo as auth_imo,
+        identity.flag as auth_flag,
+        authorized_to as registry_authorized_to,
+        authorized_from as registry_authorized_from,
+        is_active as registry_active,
+        SAFE_CAST( SPLIT(list_uvi, "-")[OFFSET(0)] AS string) AS reg,
+        first_timestamp,
+        last_timestamp
+      FROM `vessel_database.all_vessels_v20210901`
+      LEFT JOIN UNNEST(registry)
+      LEFT JOIN UNNEST(activity)
+      LEFT JOIN UNNEST(feature.geartype)
+      WHERE
+   --There are different registry records within each of these RFMOS (for instance WCPFC are current registry records online and WCPFC2 are historical registry records) but we
+   --want all records related to RFMOs that overlap in area of interest 
+      list_uvi LIKE "%NPFC%"
+      AND
+   --IMPORTANT to make sure that the time period the vessel was active on AIS was during the time period of authorization record
+   --we want the vessel to be actively transmitting on AIS at some period during 2019
+      first_timestamp <= maximum()
+      AND
+      last_timestamp >= minimum())
+),
+
+authorization_info_clean as(
+  SELECT
+  auth_ssvid,
+  authorized_to,
+  authorized_from,
+  reg,
+  first_timestamp,
+  last_timestamp
+  FROM(
+    SELECT
+    auth_ssvid,
+    auth_shipname,
+    auth_imo,
+    auth_flag,
+    registry_authorized_to as authorized_to,
+    registry_authorized_from authorized_from,
+    reg,
+    first_timestamp,
+    last_timestamp
+    FROM
+    init_npfc_auth
+    WHERE
+    --we want the registry records that occur at some point in 2019
+    TIMESTAMP(registry_authorized_from) <= maximum()
+    AND TIMESTAMP(registry_authorized_to) >= minimum()
+    --we want to make sure that there is overlap between the AIS transmission period and the registry records
+    AND(
+      registry_authorized_from > first_timestamp
+      OR
+      registry_authorized_to < last_timestamp
+    )
+  )
+  GROUP BY
+  auth_ssvid,
+  authorized_to,
+  authorized_from,
+  reg,
+  first_timestamp,
+  last_timestamp
+),
+
+--Merge authorization records with carrier vessels during the time of encounter events
+carrier_authorization as(
+  SELECT *, 
+  --Make sure that in cases where we pull mulitiple registry record sources for the same RFMO that they are renamed to the same name to reduce any duplication issues
+    CASE WHEN carrier_reg IN ("IATTC2", "IATTC3") then "IATTC"
+         WHEN carrier_reg IN ("WCPFC2", "WCPFC3") then "WCPFC"
+         WHEN carrier_reg IN ("ICCAT2", "ICCAT3") then "ICCAT"
+         WHEN carrier_reg IN ("SPRFMO2") then "SPRFMO"
+         else carrier_reg end as carrier_reg_f
+  FROM (
+    SELECT *
+    FROM all_encounters) a
+  --Join encounter data with the authorization ssvid, authorization time range, and registry name identified above. In the above query we already ensure the registry records we are pulling 
+  --are specifically for the time range of interest when we are looking at the encounters (2019) and are correctly for when the vessel was transmitting AIS during the same time period
+  LEFT JOIN(
+    SELECT
+    auth_ssvid,
+    authorized_from as carrier_authorized_from,
+    authorized_to as carrier_authorized_to,
+    reg as carrier_reg
+    FROM
+    authorization_info_clean )b
+  ON
+    SAFE_CAST(a.carrier_ssvid as STRING)=SAFE_CAST(b.auth_ssvid as string)
+    AND
+    ---Merge the authorization records that occur during the period of the encounter
+    a.event_end >=b.carrier_authorized_from
+    AND
+    a.event_start <=b.carrier_authorized_to),
+  
+all_auth as (  
+ SELECT *, 
+  --Make sure that in cases where we pull mulitiple registry record sources for the same RFMO that they are renamed to the same name to reduce any duplication issues
+  CASE WHEN fishing_reg IN ("IATTC2", "IATTC3") then "IATTC"
+       WHEN fishing_reg IN ("WCPFC2", "WCPFC3") then "WCPFC"
+       WHEN fishing_reg IN ("ICCAT2", "ICCAT3") then "ICCAT"
+       WHEN fishing_reg IN ("SPRFMO2") then "SPRFMO"
+       else fishing_reg end as fishing_reg_f
+ FROM(
+   SELECT *
+   FROM carrier_authorization) a
+ LEFT JOIN(
+   SELECT
+    auth_ssvid,
+    authorized_from as fishing_authorized_from,
+    authorized_to as fishing_authorized_to,
+    reg as fishing_reg
+   FROM
+    authorization_info_clean) b
+ ON
+  SAFE_CAST(a.trawler_ssvid as string)= SAFE_CAST(b.auth_ssvid as string)
+  AND a.event_start >=b.fishing_authorized_from
+  AND a.event_end <=b.fishing_authorized_to
+)
+
+SELECT * FROM all_auth
+
+```
+
+
+## 3.  Based on a confidence of 2, where did the carrier vessels enter port after these encounters, specifically how many port visits per port where there? (note: play around with using ssvid vs vessel id to merge the two event types, how does that affect things?)\
+
+* NOTE: Joining by SSVID could have more port visits than by vessel_id since the same SSVID can have multiple vessel_id.
+
+```{sql connection = con, output.var = "carrier_ports"}
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (TIMESTAMP("2021-07-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (TIMESTAMP("2021-09-30"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2021 AS INT64));
+----------------------------------
+
+WITH
+
+vessel_info AS (
+  SELECT *
+  FROM `pipe_production_v20201001.vessel_info`
+),
+
+-- Get list of trawler vessels active during the timeperiod of interest
+-- Use gfw_research.vi_ssvid_v20210913 since the all_vessels_v table does not have vessel_class information
+trawler_vessels AS (
+  SELECT 
+    ssvid AS trawler_ssvid,
+    ais_identity.n_shipname_mostcommon.value as shipname,
+    ais_identity.n_imo_mostcommon.value as trawler_imo,
+    ais_identity.n_callsign_mostcommon.value as trawler_callsign,
+    best.best_flag as trawler_flag,
+    activity.first_timestamp AS first_timestamp,
+    activity.last_timestamp AS last_timestamp
+  FROM `world-fishing-827.gfw_research.vi_ssvid_v20210913` 
+  WHERE TIMESTAMP(activity.last_timestamp) >= minimum()
+  AND TIMESTAMP(activity.first_timestamp) <= maximum()
+  AND best.best_vessel_class = "trawlers" -- Should I use best.best_vessel_class or inferred.inferred_vessel_class?
+  AND on_fishing_list_best
+),
+
+-- Get vessel_id for trawlers since the Encounters table has vessel_id instead of ssvid
+trawlers_vessel_id AS (
+  SELECT t.*, v.vessel_id, "trawler" as class
+  FROM trawler_vessels t
+  LEFT JOIN 
+    (SELECT
+        ssvid,
+        vessel_id, 
+        last_timestamp, 
+        first_timestamp 
+    FROM vessel_info) v
+  ON t.trawler_ssvid = v.ssvid
+  WHERE TIMESTAMP(v.last_timestamp) >= minimum() -- or should this be compared against t.first_timestamp()?
+  AND TIMESTAMP(v.first_timestamp) <= maximum() -- or should this be compared against t.last_timestamp()?
+),
+
+-- Get list of carrier vessels active during the timeperiod of interest
+carrier_vessels AS (
+  SELECT
+    identity.ssvid AS carrier_ssvid,
+    identity.n_shipname AS shipname,
+    first_timestamp AS first_timestamp,
+    last_timestamp AS last_timestamp
+  FROM
+    `world-fishing-827.vessel_database.all_vessels_v20210901`
+  LEFT JOIN UNNEST(registry)
+  LEFT JOIN UNNEST(activity)
+  --LEFT JOIN UNNEST(feature.geartype) as feature_gear
+  WHERE is_carrier 
+    AND confidence >= 3
+    AND identity.ssvid NOT IN ("111111111","0","888888888","416202700")
+    AND TIMESTAMP(first_timestamp) <= maximum()
+    AND TIMESTAMP(last_timestamp) >= minimum()
+  GROUP BY 1,2,3,4
+),
+
+-- Get vessel_id for carriers since the Encounters table has vessel_id instead of ssvid
+-- the number of distinct carrier_ssvid in the carriers_vessel_id is 1,107 but the 
+-- number of distinct carrier_ssvid in the carrier_vessels is 1,111. Why? It should be equal since we are just appending vessel_id to the carrier_vessels table.
+carriers_vessel_id AS (
+  SELECT c.*, v.vessel_id, "carrier" as class
+  FROM carrier_vessels c
+  LEFT JOIN 
+    (SELECT
+        ssvid,
+        vessel_id, 
+        last_timestamp, 
+        first_timestamp 
+    FROM vessel_info) v
+  ON c.carrier_ssvid = v.ssvid
+  WHERE TIMESTAMP(v.last_timestamp) >= minimum() -- or should this be compared against c.first_timestamp()?
+  AND TIMESTAMP(v.first_timestamp) <= maximum() -- or should this be compared against c.last_timestamp()?
+), 
+
+-- combine trawlers and carrier SSVID with vessel class for joining with encounters
+carrier_trawlers AS (
+  
+  SELECT carrier_ssvid as ssvid, vessel_id, class, first_timestamp, last_timestamp, shipname
+  FROM carriers_vessel_id UNION ALL
+  SELECT trawler_ssvid as ssvid, vessel_id, class, first_timestamp, last_timestamp, shipname
+  FROM trawlers_vessel_id
+  
+),
+
+-- retrieve NPFC polygon
+npfc_shape as (
+  SELECT st_GeogFromText(string_field_1, make_valid=>TRUE) AS npfc
+  FROM `ocean_shapefiles_all_purpose.NPFC_shape`
+),
+
+
+-- extract all encounters inside NPFC during the timeperiod and filtering for minimum duration (2 hours) and minimum median speed (2 knots)
+encounters AS (
+  SELECT
+    SPLIT(event_id, ".")[ORDINAL(1)] AS encounter_id,
+    event_id,
+    vessel_id,
+    event_start,
+    event_end,
+    lat_mean,
+    lon_mean,
+    JSON_EXTRACT(event_info,
+               "$.median_distance_km") AS median_distance_km,
+    JSON_EXTRACT(event_info,
+               "$.median_speed_knots") AS median_speed_knots,
+    SPLIT(event_id, ".")[ORDINAL(1)] AS event,
+    CAST (event_start AS DATE) event_date,
+    EXTRACT(YEAR FROM event_start) AS year
+  FROM
+    `world-fishing-827.pipe_production_v20201001.published_events_encounters`, npfc_shape
+  WHERE TIMESTAMP(event_start) >= minimum()
+   AND TIMESTAMP(event_end) <= maximum()
+   AND lat_mean < 90
+   AND lat_mean > -90
+   AND lon_mean < 180
+   AND lon_mean > -180
+   AND ST_CONTAINS(npfc_shape.npfc, ST_GEOGPOINT(lon_mean,lat_mean))
+),
+
+encounter_ssvid AS (
+ SELECT * EXCEPT(vessel_id)
+  FROM (
+      SELECT *
+      FROM encounters) a
+  JOIN (
+      SELECT *
+      FROM carrier_trawlers) b
+  ON a.vessel_id = b.vessel_id
+),
+
+encounters_carriers AS (
+  SELECT *
+  FROM encounter_ssvid
+  WHERE class = "carrier"
+),
+
+all_encounters as (
+  SELECT
+    encounter_id,
+    event_start,
+    event_end,
+    lat_mean as mean_lat,
+    lon_mean as mean_lon,
+    median_distance_km,
+    median_speed_knots,
+    (TIMESTAMP_DIFF(event_end,event_start,minute)/60) event_duration_hr,
+    event_date,
+    a.ssvid as carrier_ssvid,
+    a.class as carrier_class,
+    a.shipname as carrier_shipname,
+    a.first_timestamp as carrier_first_timestamp,
+    a.last_timestamp as carrier_last_timestamp,
+    b.ssvid as trawler_ssvid,
+    b.class as trawler_class,
+    b.shipname as trawler_shipname,
+    b.first_timestamp as trawler_first_timestamp,
+    b.last_timestamp as trawler_last_timestamp,
+  FROM encounters_carriers a
+  JOIN (
+    SELECT
+      encounter_id,
+      ssvid,
+      class,
+      shipname,
+      first_timestamp,
+      last_timestamp
+    FROM encounter_ssvid
+    WHERE class = "trawler") b
+  USING (encounter_id)
+  WHERE a.ssvid != b.ssvid
+  GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19),
+
+port_visits AS (
+  SELECT 
+    ssvid,
+    vessel_id,
+    trip_start,
+    trip_end,
+    trip_end_anchorage_id,
+    trip_end_confidence,
+    sublabel,
+    label,
+    iso3
+  FROM `pipe_production_v20201001.proto_voyages_c2` a
+  JOIN (
+    SELECT
+      s2id,
+      sublabel,
+      label,iso3
+    FROM `gfw_research.named_anchorages`) b
+  ON a.trip_end_anchorage_id = b.s2id
+  WHERE trip_end_confidence >= 2
+),
+
+encounter_endPorts AS (
+  SELECT * 
+  FROM all_encounters a
+  LEFT JOIN port_visits b
+  ON a.carrier_ssvid = b.ssvid
+  WHERE event_end BETWEEN trip_start AND trip_end
+)
+
+SELECT * FROM encounter_endPorts
+```
+
+## 4.  How many total fishing hours did the trawlers have prior to encountering the carrier and after leaving their most recent port visit (based on a confidence of 2)? Which trawler had the most fishing hours prior to an encounter on a single voyage, and how many hours was it?\
+
+```{sql connection = con, output.var = "trawler_hours"}
+
+```

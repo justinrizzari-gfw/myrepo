@@ -1,0 +1,327 @@
+---
+title: "2 Vessel Information Questions"
+author: "Adel"
+date: "26/07/2021"
+output: html_document
+---
+
+
+ACTIONS
+
+-- check the ids vessel info table
+-- check
+
+Does message type 27 come from all devices, so just a small fraction from a device.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = FALSE)
+library(tidyverse)
+library(fishwatchr)
+library(bigrquery)
+library(ggplot2)
+#
+setwd("~/Documents/GitHub/analysis-training-queries")
+
+# Establish connection to BigQuery project
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", 
+                      use_legacy_sql = FALSE)
+```
+
+
+## Vessel Info Questions
+
+### 1. What is the name, callsign, flag state, and imo of the vessel with mmsi 353154000 during 2018?
+
+```{r Q1}
+#
+
+tq<- c(
+"
+SELECT 
+ais_identity.n_shipname_mostcommon,
+ais_identity.n_callsign_mostcommon,
+ais_identity.flag_mmsi, ## use best.best_flag as flag -- this is because when there is best info available default to that. if want to be consistent with the map, the map uses AIS identities and from a a data perspective, it is more likely the AIS is up to date, whereas the registry might be out of date
+ais_identity.n_imo_mostcommon
+
+
+FROM
+`world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+WHERE ssvid = '353154000' AND
+year = 2018
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+
+
+Answer
+
+Shipname - CABODEPALOS
+Call sign - HP5179
+Flag - PAN
+IMO - 7363700
+
+
+### 2. Is the above answer different if you pull from the vessel info table (gfw_research.vi_ssvid_v) versus the vessel registry table (vessel_database.all_vessels_v)?
+
+Vessel info table
+```{r Q2 Info table}
+#
+
+tq<- c(
+"
+SELECT
+year, 
+ais_identity.n_shipname_mostcommon,
+ais_identity.n_callsign_mostcommon,
+ais_identity.flag_mmsi,
+ais_identity.n_imo_mostcommon
+
+
+FROM
+`world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+WHERE ssvid = '353154000'
+
+
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+
+
+Answer
+
+Running from not the yearly version:
+
+Shipname - KINGBEANS
+Call sign - 3FKO6
+Flag - PAN
+IMO - 9550151
+
+Vessel registry table
+```{r Q2 Vessel registry table}
+#
+
+tq<- c(
+"
+SELECT
+ matched, loose_match, identity, activity
+FROM
+ `world-fishing-827.vessel_database.all_vessels_v20210601`,
+ UNNEST(activity) AS activity
+WHERE
+ identity.ssvid = '353154000'
+ AND matched ## only show matched with AIS data
+ AND activity.first_timestamp IS NOT NULL
+ AND activity.last_timestamp IS NOT NULL
+ORDER BY activity.first_timestamp, activity.last_timestamp
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+dd$data$activity
+
+```
+
+
+Notes on vessel registry cols
+Match: whether the record is a match between registry and AIS)
+Loose match: whether the record is a loose match, only by name and MMSI MID code
+Identity: ssvid (MMSI), normalized shipname, normalized callsign, IMO, flag
+activity: First/last timestamps and number of messages of matched AIS records
+
+So the vessel switched identity from Kingbeans to Cabodepalos in 2018.
+
+Note: if you were to pull only ssvid by year, you could miss vessels which have changed names ssvid by year - it provides aggregated info. If you want to know about very specific time periods, then you need to look at the vessel database across years. This is about the scale and therefore drill into data accordingly.
+
+Vessel info table == summary of AIS identify and any registry information on that vessel
+Vessel database == AIS data, registry data, nn predictions about the MMSI from the model AND the best value section (class, dimensions, flag) -- these deal with conflicting information.Does the nn run separately per year, so when you use the ssvid_by year the nn could return different values?
+
+When looking at a year or within a year, -- definitely check by year as well as vi_ssvid by year.
+
+```
+
+
+
+### 3. Should you use gfw_research.vi_ssvid_v or gfw_research.vi_ssvid_byyear_v to answer question 1 in the vessel info section?
+
+From a data query size perspective:
+By year is 409 MB
+Not by year is 101 MB
+
+So (weirdly to me) -- the by year table is a larger query to run.
+
+From an analysis perspective:
+
+Depends on the context -- if you are working for a specific year of interest only 
+Run by year so that this type of differences across year can be understood for context to an analysis
+
+Run by all years if you want the 'best' allocation of vessel information to that vessel.
+
+### 4. Is the vessel considered a ‘carrier’?
+
+```{r Q1}
+#
+
+tq<- c(
+"
+SELECT 
+ais_identity.n_shipname_mostcommon,
+ais_identity.n_callsign_mostcommon,
+ais_identity.flag_mmsi,
+ais_identity.n_imo_mostcommon,
+ais_identity.shiptype,
+best.best_vessel_class,
+year
+
+FROM
+`world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+WHERE ssvid = '353154000'
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+
+This vessel is categorized primarily as a cargo vessel by the best vessel class. Prior to 2018 this was a cargo vessel of type (Cargo, all ships of this type) -- so could be a carrier, but could be any other type of cargo vessel (tanker etc.).
+
+Q why does best vessel allocation stay as cargo on years where it is broadcasting more signals as a fishing vessel (e.g. 2017)?
+
+Need to go through logic of best class to make sure I understand it.
+
+
+
+### 5. Is the vessel a fishing vessel? What are different ways you could determine if the vessel was a fishing vessel? 
+
+Looks like it was reclassified from cargo to fishing in 2018. 
+
+To determine whether this is a fishing vessel I would:
+
+1. Check marinetraffic -- which states it is a trawler 
+https://www.marinetraffic.com/en/ais/details/ships/shipid:4947083/mmsi:353154000/imo:7363700/vessel:CABO_DE_PALOS
+2. Check vessel registry information:
+
+
+
+```{r Q1}
+#
+
+tq<- c(
+"
+SELECT 
+ais_identity.n_shipname_mostcommon,
+ais_identity.n_callsign_mostcommon,
+ais_identity.flag_mmsi,
+ais_identity.n_imo_mostcommon,
+ais_identity.shiptype,
+best.best_vessel_class, ## tends not to change between vi ssvid and vi ssvid by year table -- so the by year table is based on nn from all years -- not that specific year unless for gear which might get pciked up based on name
+year
+
+FROM
+`world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706`
+WHERE ssvid = '353154000'
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+
+```
+
+
+Vessel class -- nn designed and is most accurate when it looks at large chunks of time. Runs on 6 months windows of activity -- it uses all the nn results to created one predicted vessel class.
+Registry information --only looks at what the vessel is registered as.
+Overall nn prediction whcih is inferred.inferred_vessel_class_ag
+registry.info.best_known_vessel_class (from registry)
+onfishing list values x4 -- 
+
+on what basis does the nn infer vessel class?
+I understand how the nn works on the basis of fishing activity and behaviour / movement - but what about the vessel type.
+
+Still don't understand what goes into the nn - the past vessel information?
+
+### 6. What is considered based on the best vessel class? Does this differ from what it is considered when looking at vessel_database.all_vessels_v?
+
+Best vessel class means it is either:
+a. onfishinglist known (i.e. the registry informatiom from the vessel database)
+b. it self reports as fishing (on the AIS device itself)
+c. the inferred vessel class is > 0.85 for a fishing vessel
+d. the nn classifies it as fishing and fishing list (from vessel database) is not false
+
+So best vessel class differs from the vessel database because vessel database pulls information from > 30 registries of fishing boats, best vessel class combines this information with the AIS data (i.e. what it broadcasts) as well as what is modelled from the neural net.
+
+
+vI ssvid my
+
+class information is pretty consistent with vi ssvid and vs ssvid_by year
+
+carrier, or registry specific information -- use the vessel database or the other daily tables (see 07 training slides)
+### 7. Was the vessel ‘authorized’ by any RFMO during 2018? If so, which ones and what are the registry periods?
+
+```{r}
+## need to make sure the authorisation and the registry information overlap between when active and when authorized/
+
+## need to check the answer from Hannah code
+
+tq<- c(
+"
+SELECT
+ matched, loose_match,
+ identity,
+ feature,
+ activity,
+ ARRAY(
+   SELECT list_uvi
+   FROM UNNEST(registry)
+   GROUP BY 1 ) AS list_uvi
+FROM `world-fishing-827.vessel_database.all_vessels_v20210601`
+WHERE identity.ssvid = '353154000'
+"
+)
+
+
+## run query
+dd<-gfw_query(query = tq, 
+                          run_query = TRUE, 
+                          con = con)
+
+view(dd$data)
+```
+
+
+This vessel was registered in 2018 under the name of CABODEPALOS by ICCAT, as a supply vessel. Prior to July it was listed as Everest briefly, also by ICCAT, also as a supply vessel, then for first few days of 2018 under the name of KingBeans as cargo.

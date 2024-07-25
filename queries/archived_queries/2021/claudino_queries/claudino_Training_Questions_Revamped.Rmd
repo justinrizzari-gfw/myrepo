@@ -1,0 +1,1087 @@
+---
+title: "Transshipment inspection"
+output: 
+  html_notebook: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Auxiliary libraries
+
+```{r, message=FALSE}
+library(tidyverse)
+library(REdaS)
+library(bigrquery)
+library(DBI)
+library(fishwatchr)
+library(glue)
+library(lubridate)
+library(here)
+library(sf)
+library(flextable)
+```
+
+# Connect to database
+
+```{r}
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), 
+                      project = "world-fishing-827", 
+                      use_legacy_sql = FALSE)
+```
+
+<https://docs.google.com/document/d/1HOzjiiIc0n7GGSffvqJXoNues_i3la1O4KlM6Ox3Qog/edit>
+
+# **Vessel Track Questions**
+
+## 1. Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 without any filters to 'clean' the data.
+
+## 2. Based on what you are seeing, investigate the connection between, ssvid, vessel id, and seg_id during the time the track seems to make less sense using tables `pipe_production_v20201001.segment_info` and `world-fishing-827.gfw_research.pipe_v20201001_segs`. Can you identify what is occurring in the data to cause the wonky tracks?
+
+## 3. Plot the track for MMSI 352894000 from October 24th 2017 - November 6 2017 again but removing noise.
+
+# **Vessel Info Questions**
+
+    1. What is the name, callsign, flag state, and imo of the vessel with mmsi  353154000 during 2018?
+    2. Is the above answer different if you pull from the vessel info table (gfw_research.vi_ssvid_v) versus the vessel registry table (vessel_database.all_vessels_v)?
+
+3.  Should you use gfw_research.vi_ssvid_v or gfw_research.vi_ssvid_byyear_v to answer question 1 in the vessel info section?
+4.  Is the vessel considered a 'carrier'?
+5.  Is the vessel a fishing vessel? What are different ways you could determine if the vessel was a fishing vessel?
+6.  What is considered based on the best vessel class? Does this differ from what it is considered when looking at vessel_database.all_vessels_v?
+7.  Was the vessel 'authorized' by any RFMO during 2018? If so, which ones and what are the registry periods?
+
+# **Fishing inspection**
+
+## 1. We may also want to know about fishing. Plot a map of the track and fishing points by the vessel with the MMSI 367650000 between March 1 2017 and March 5 2017. Are there any issues with the track?
+
+## 2. How many hours of fishing are estimated during this time? Is it different if you use the `pipe_production_v20201001.proto_events_fishing` table?
+
+## 3. What type of fishing vessel is it?
+
+## 4. Provide the other vessel identity information and registry records during this time.
+
+## 5. Let's take the scale up for a second. Plot a raster of all fishing by Chinese flagged squid jiggers vessels in NPFC in 2018. What are some caveats to take into consideration with this data?
+
+# **Transshipment inspection**
+
+## 1. How many encounter events did CHITOSE have with fishing vessels in the first six months of 2021?
+
+```{sql connection=con, output.var = 'carrier_vessel'}
+
+SELECT DISTINCT 
+identity.ssvid,
+identity.n_shipname,
+identity.n_callsign,
+identity.imo,
+first_timestamp,
+last_timestamp 
+FROM 
+`world-fishing-827.vessel_database.all_vessels_v20210701`
+LEFT JOIN UNNEST (activity)
+WHERE
+identity.n_shipname = 'CHITOSE'
+AND is_carrier IS TRUE
+GROUP BY identity.ssvid,
+identity.n_shipname,
+identity.n_callsign,
+identity.imo,
+first_timestamp,
+last_timestamp 
+
+
+```
+
+```{sql connection = con, output.var = "encounters_method_1"}
+----Hannah Linder 
+---Transshipment example using pipe_production_v2021001.encounters table for encounters in 2021 between CHITOSE and fishing vessels
+---August 19,2021
+----Note: the example shown here is using a similar method of identifying encounters as the CVP uses, see code here:
+----https://github.com/GlobalFishingWatch/pipe-carrier-portal/blob/master/assets/bigquery/events-encounter-events-01.sql.j2
+---------------------------------------------------------------------------------
+--------Initially curious about a carrier named CHITOSE, so pulling relevant information from v.database
+WITH
+carrier as (
+ SELECT DISTINCT 
+identity.ssvid as ssvid,
+identity.n_shipname as shipname,
+identity.n_callsign as callsign,
+identity.imo as imo,
+identity.flag as flag,
+is_carrier,
+first_timestamp,
+last_timestamp 
+FROM 
+`world-fishing-827.vessel_database.all_vessels_v20210701`
+LEFT JOIN UNNEST (activity)
+WHERE
+identity.n_shipname = 'CHITOSE'
+AND is_carrier IS TRUE
+GROUP BY identity.ssvid,
+identity.n_shipname,
+identity.n_callsign,
+identity.imo,
+identity.flag,
+is_carrier,
+first_timestamp,
+last_timestamp 
+),
+----------------------------------------------
+-----This version of the encounters table has vessel_id and seg_id but not ssvid so will need vessel_info table to merge information
+  vessel_info AS (
+    SELECT
+      *
+    FROM
+      `pipe_production_v20201001.vessel_info`
+  ),
+------------------------------
+---We are curious about encounters with fishing vessels so I'm pulling fishing vessel and their id information here
+----NOTE TO SELF: Do I still need to pull from 2020 for vessels in 2021?
+  fishing_vessels AS (
+   SELECT 
+   ssvid,
+ais_identity.n_shipname_mostcommon.value as shipname,
+ais_identity.n_imo_mostcommon.value as imo,
+ais_identity.n_callsign_mostcommon.value as callsign,
+best.best_flag as flag,
+best.best_vessel_class as vessel_class,
+year
+----Because I'm curious about 2021 I pull from the by_year here, but if I was looking across years
+---I could change this to the general vi_ssvid_v table and use the activity timestamps to specify the time range
+FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210706` 
+WHERE
+year = 2021
+---Here I could specify on_fishing_list_best instead, but this provides me with a slightly less noisey set of vessels
+AND ssvid IN (SELECT ssvid FROM `world-fishing-827.gfw_research.fishing_vessels_ssvid_v20210706` WHERE year = 2021)
+  ), 
+  -- Pulling encounters. From this dataset there are less internally specified restrictions, 
+  ----so we specify that we want median speed less than 2 knots and at least 2 hours in duration
+  encounters AS (
+  SELECT
+    *
+  FROM
+    pipe_production_v20201001.encounters
+  WHERE
+    TIMESTAMP_DIFF(end_time, start_time, SECOND) > (3600 * 2)
+    AND median_speed_knots < 2
+    AND start_time<=timestamp('2021-12-31')
+    AND end_time >=timestamp('2021-01-01')),
+-------------
+---Here we merge encounters information with vessel id table to get ssvid for both 
+---vessel 1 and vessel 2
+---because both vessels are on the same row in this table you need to join the vessel info table 2, once to vessel1 and once to vessel 2
+----------------
+  encounters_ssvid_info AS (
+  SELECT
+encounter_id,
+start_time,
+end_time,
+mean_latitude,
+mean_longitude,
+median_distance_km,
+median_speed_knots,
+start_lat,
+start_lon,
+end_lon,
+end_lat,
+vessel_info_1.ssvid as ssvid_1,
+vessel_info_2.ssvid as ssvid_2,
+  FROM
+    encounters
+  INNER JOIN
+    vessel_info AS vessel_info_1
+  ON
+    encounters.vessel_1_id = vessel_info_1.vessel_id 
+   INNER JOIN
+    vessel_info AS vessel_info_2
+  ON
+    encounters.vessel_2_id = vessel_info_2.vessel_id
+  ),
+----------------------------
+--------Here we are joining the encounter information with carrier information
+------------
+carrier_encounters as(
+  SELECT 
+  encounter_id,
+start_time,
+end_time,
+mean_latitude,
+mean_longitude,
+median_distance_km,
+median_speed_knots,
+start_lat,
+start_lon,
+end_lon,
+end_lat,
+----Because vessel 1 or vessel 2 in the encounter could be the carrier we use these 
+----if statements to ensure that we create a new ssvid column based on either one being the carrier,
+----and the other one is the other vessel, which we will specify in the next subquery as a fishing vessel
+    IF (carrier_1.is_carrier,
+      encounters_ssvid_info.ssvid_1,
+      encounters_ssvid_info.ssvid_2
+    ) as carrier_ssvid,
+    IF (carrier_1.is_carrier,
+      encounters_ssvid_info.ssvid_2,
+      encounters_ssvid_info.ssvid_1
+    ) as fishing_ssvid,
+  FROM 
+  encounters_ssvid_info
+----Below we need to merge both vessel 1 and vessel 2 with the carrier information 
+-----because the carrier could be considered either one in the encounter. Also specify that carrier transmission time range occurs during the encounter time
+  LEFT JOIN
+   carrier AS carrier_1
+  ON
+    encounters_ssvid_info.ssvid_1 = carrier_1.ssvid
+AND encounters_ssvid_info.start_time between carrier_1.first_timestamp and carrier_1.last_timestamp
+  LEFT JOIN
+   carrier AS carrier_2
+  ON
+    encounters_ssvid_info.ssvid_2 = carrier_2.ssvid
+AND encounters_ssvid_info.start_time between carrier_2.first_timestamp and carrier_2.last_timestamp
+  WHERE
+    (carrier_1.is_carrier)
+    OR (carrier_2.is_carrier))
+----Finally here specify that the other ssvid should be a fishing vessel 
+----from the list of fishing vessels established earlier, and considered a fishing vessel during the time of the encounter
+SELECT 
+  encounter_id,
+start_time,
+end_time,
+mean_latitude,
+mean_longitude,
+median_distance_km,
+median_speed_knots,
+start_lat,
+start_lon,
+end_lon,
+end_lat,
+carrier_ssvid,
+carrier.shipname as carrier_shipname,
+carrier.flag as carrier_flag,
+fishing_ssvid,
+fishing_vessels.shipname as fishing_shipname,
+fishing_vessels.flag as fishing_flag,
+fishing_vessels.vessel_class as fishing_class,
+FROM 
+carrier_encounters 
+ INNER JOIN
+    carrier
+  ON
+    carrier_encounters.carrier_ssvid = carrier.ssvid
+ INNER JOIN
+    fishing_vessels
+  ON
+    carrier_encounters.fishing_ssvid = fishing_vessels.ssvid
+    AND EXTRACT(year FROM carrier_encounters.start_time) = fishing_vessels.year
+```
+
+```{sql connection = con, output.var = "encounters_method_2"}
+#standardSQL
+  -- Adding Vessel Info to Carrier specific Encounters
+  -- Hannah Linder, Updated August 19,2021
+  --This query is another example of how to merge carrier and fishing vessel info but 
+  --using the published_events_encounters table rather than encounters
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE('2021-01-01'));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE('2021-12-31'));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2021 AS INT64));
+####
+ -- Retrieve initial encounter data, specifing time range and lat/lon
+ -- JSON_EXTRACT is used to seperate the listed event_info data of interest into separate columns
+ --JSON_EXTRACT_SCALAR is used to retrieve the ssvid from the event_vessel nested column
+WITH
+encounters AS (
+SELECT
+event_id,
+ JSON_EXTRACT_SCALAR(event_vessels,
+ "$[0].ssvid") as ssvid,
+vessel_id,
+event_start,
+event_end,
+lat_mean,
+lon_mean,
+JSON_EXTRACT(event_info,
+"$.median_distance_km") AS median_distance_km,
+JSON_EXTRACT(event_info,
+"$.median_speed_knots") AS median_speed_knots,
+SPLIT(event_id, ".")[ORDINAL(1)] AS event,
+CAST (event_start AS DATE) event_date,
+EXTRACT(YEAR FROM event_start) AS year
+FROM
+`world-fishing-827.pipe_production_v20201001.published_events_encounters`
+WHERE
+DATE(event_start) >= minimum()
+AND DATE(event_end) <= maximum()
+---The below restrictions are just a precaution to remove any encounters that may be noisey 
+---and produce odd coordinate locations outside the scope of the globe
+AND lat_mean < 90
+AND lat_mean > -90
+AND lon_mean < 180
+AND lon_mean > -180),
+#####
+ #####
+  ---create curated carrier list
+  ---Remember to change the database version to the most recent version
+  --time range of carriers should overlap with the time of encounters to ensure they are actively transmitting during
+  --as carriers during the time of encounters
+  carrier_vessels AS (
+SELECT
+ identity.ssvid AS carrier_ssvid,
+ identity.imo AS carrier_imo_ais,
+ identity.n_shipname AS carrier_shipname_ais,
+ identity.n_callsign AS carrier_callsign_ais,
+ identity.flag AS carrier_flag,
+ feature_gear as carrier_label,
+ first_timestamp AS carrier_first_timestamp,
+ last_timestamp AS carrier_last_timestamp,
+FROM
+`world-fishing-827.vessel_database.all_vessels_v20210701`
+LEFT JOIN UNNEST(registry)
+LEFT JOIN UNNEST(activity)
+LEFT JOIN UNNEST(feature.geartype) as feature_gear
+WHERE is_carrier AND
+identity.ssvid = '563418000' AND
+DATE(first_timestamp) <= maximum()
+AND DATE(last_timestamp) >= minimum()
+GROUP BY 1,2,3,4,5,6,7,8),
+  ###
+  --Identify encounters with carriers
+  --time range of carriers should overlap with the time of encounters to ensure they are actively transmitting during
+  --as carriers during the time of encounters
+  encounters_carriers AS(
+  SELECT
+    *
+  FROM (
+    SELECT
+      *
+    FROM
+      encounters)a
+  JOIN (
+    SELECT
+      *
+    FROM
+      carrier_vessels)b
+  ON
+    a.ssvid=SAFE_CAST(b.carrier_ssvid AS STRING)
+    AND a.event_start BETWEEN b.carrier_first_timestamp
+    AND b.carrier_last_timestamp
+    AND a.event_end BETWEEN b.carrier_first_timestamp
+    AND b.carrier_last_timestamp),
+  ####
+  --Join vessel the carrier encountered
+  --because there is one row per vessel (therefore two rows per encounter) just join again with the encounter dataset 
+  --on the unqiue event id but specify it must be the non-carrier ssvid this time
+all_encounters as (
+SELECT
+carrier_ssvid,
+carrier_label,
+neighbor_ssvid,
+event_start,
+event_end,
+lat_mean as mean_lat,
+ lon_mean as mean_lon,
+ median_distance_km,
+ median_speed_knots,
+ (TIMESTAMP_DIFF(event_end,event_start,minute)/60) event_duration_hr,
+a.event AS event,
+event_date
+FROM
+(
+SELECT
+*
+FROM
+encounters_carriers) a
+JOIN
+(SELECT
+ssvid AS neighbor_ssvid,
+event
+FROM
+encounters) b
+ON a.event = b.event
+WHERE carrier_ssvid != neighbor_ssvid
+GROUP BY
+1,2,3,4,5,6,7,8,9,10,11,12),
+######
+--add vessel info to the carriers
+--note: could have also pulled vessel identity information from v.database but 
+--this can allow you to pull some extra fields and be consistent with the vessel 
+--identity source used for fishing vessels
+carrier_vessel_info as(
+SELECT
+*
+FROM
+(SELECT
+*
+FROM
+all_encounters)a
+LEFT JOIN(
+SELECT
+ssvid as ssvid,
+ais_identity.n_shipname_mostcommon.value AS carrier_shipname,
+ais_identity.n_callsign_mostcommon.value AS carrier_callsign,
+ais_identity.n_imo_mostcommon.value as carrier_imo,
+activity.first_timestamp as first_timestamp,
+activity.last_timestamp as last_timestamp,
+best.best_flag AS carrier_flag,
+activity.frac_spoofing as carrier_spoofing
+FROM
+gfw_research.vi_ssvid_byyear_v20210706
+WHERE
+year = yoi())b
+ON
+SAFE_CAST(a.carrier_ssvid as int64)=SAFE_CAST(b.ssvid as int64)
+AND
+a.event_start>=b.first_timestamp
+AND
+a.event_end<=b.last_timestamp),
+--add vessel info to neighbor vessel 
+--and specify that you want it to be a fishing vessel
+neighbor_vessel_info as(
+SELECT
+*
+FROM
+(SELECT
+*
+FROM
+carrier_vessel_info)a
+JOIN(
+SELECT
+ssvid,
+ais_identity.n_shipname_mostcommon.value  as fishing_shipname,
+ais_identity.n_imo_mostcommon.value as fishing_imo,
+ais_identity.n_callsign_mostcommon.value   as fishing_callsign,
+best.best_flag  as fishing_flag,
+IF(best.best_vessel_class IS NULL, inferred.inferred_vessel_class, best.best_vessel_class) AS fishing_label,
+activity.first_timestamp as fishing_first_timestamp,
+activity.last_timestamp as fishing_last_timestamp,
+activity.frac_spoofing as fishing_spoofing
+FROM
+`gfw_research.vi_ssvid_byyear_v20210706`
+WHERE
+year = 2021
+AND ssvid IN (SELECT ssvid FROM `world-fishing-827.gfw_research.fishing_vessels_ssvid_v20210706` WHERE year = 2021))b
+ON
+SAFE_CAST(a.neighbor_ssvid as int64)=SAFE_CAST(b.ssvid as int64)
+AND
+a.event_start>=b.fishing_first_timestamp
+AND
+a.event_end<=b.fishing_last_timestamp)
+#####
+--Clean up the data to the columns we are interested in,
+--and group data to remove any possible duplications generated in the process of creating data
+SELECT
+carrier_ssvid,
+carrier_shipname,
+carrier_imo,
+carrier_callsign,
+carrier_label,
+carrier_flag,
+neighbor_ssvid as fishing_ssvid,
+fishing_shipname,
+fishing_imo,
+fishing_callsign,
+fishing_flag,
+fishing_label,
+event_start,
+event_end,
+mean_lat,
+mean_lon,
+ median_distance_km,
+ median_speed_knots,
+event_duration_hr
+FROM
+neighbor_vessel_info
+GROUP BY
+carrier_ssvid,
+carrier_shipname,
+carrier_imo,
+carrier_callsign,
+carrier_label,
+carrier_flag,
+fishing_ssvid,
+fishing_shipname,
+fishing_imo,
+fishing_callsign,
+fishing_flag,
+fishing_label,
+event_start,
+event_end,
+mean_lat,
+mean_lon,
+ median_distance_km,
+ median_speed_knots,
+event_duration_hr
+```
+
+```{r}
+carrier_vessel %>%
+    flextable()
+
+
+```
+
+## 2. Where did Chitose go to port after these encounter events (just list the unique ports)?
+
+```{sql connection = con, output.var = "loitering"}
+--Hannah Linder
+--August 19,2021
+--example query: IOTC 2020 loitering events by carriers
+---SET your date minimum of interest
+CREATE TEMP FUNCTION minimum() AS (DATE("2020-01-01"));
+---SET your date maximum of interest
+CREATE TEMP FUNCTION maximum() AS (DATE("2020-12-31"));
+--SET your year of interest
+CREATE TEMP FUNCTION yoi() AS (CAST(2020 AS INT64));
+--SET loitering minimum duration
+CREATE TEMP FUNCTION min_duration() AS (CAST(4 AS INT64));
+--SET loitering maximum duration
+CREATE TEMP FUNCTION max_duration() AS (CAST(24 AS INT64));
+--SET loitering average distance from shore (nm)
+CREATE TEMP FUNCTION dist_from_shore() AS (CAST(20 AS INT64));
+----------------------------------
+---create curated carrier list
+WITH 
+---NOTE: old standard method to identify carriers, however there is a new yearly table that I will use instead below because it is 
+--more succinct
+--carrier_vessels AS (
+--  SELECT
+--  identity.ssvid AS carrier_ssvid,
+--  identity.imo AS carrier_imo_ais,
+--  identity.n_shipname AS carrier_shipname_ais,
+--  identity.n_callsign AS carrier_callsign_ais,
+--  identity.flag AS carrier_flag,
+--  feature_gear as carrier_label,
+--  first_timestamp AS carrier_first_timestamp,
+--  last_timestamp AS carrier_last_timestamp,
+--  FROM
+--  `world-fishing-827.vessel_database.all_vessels_v20210701`
+--  LEFT JOIN UNNEST(registry)
+--  LEFT JOIN UNNEST(activity)
+--  LEFT JOIN UNNEST(feature.geartype) as feature_gear
+--  WHERE is_carrier 
+--  AND confidence >= 3
+--  AND identity.ssvid NOT IN ("111111111","0","888888888","416202700")
+--  AND DATE(first_timestamp) <= maximum()
+--  AND DATE(last_timestamp) >= minimum()
+--  GROUP BY 1,2,3,4,5,6,7,8),
+carrier_vessels as(
+    SELECT *
+    FROM 
+    vessel_database.carrier_vessels_byyear_v20210701
+    WHERE
+    year = yoi()
+),
+--####
+--Search for only carrier vessels in loitering table, specifying lat,lon, time, and minimum duration of event
+--Note the ST_CENTROID function calculated the the lat/lon between the start and end lat/lon values
+--Note that I specify distance from shore, minimum loitering duration, and ensure the segments are considered 'good' aka less noisy
+loitering as(
+  SELECT
+  *
+  FROM (
+  SELECT
+  vessel_id,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  start_lon,
+  start_lat,
+  end_lon,
+  end_lat,
+   ST_X(centroid) as mean_lon,
+   ST_Y(centroid) as mean_lat
+  FROM(
+  SELECT
+  ssvid as vessel_id,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  start_lon,
+  start_lat,
+  end_lon,
+  end_lat,
+  ST_CENTROID( ST_UNION(ST_GEOGPOINT(start_lon,
+          start_lat),
+        ST_GEOGPOINT(end_lon,
+          end_lat)) ) centroid
+  FROM
+  `pipe_production_v20201001.loitering` 
+  WHERE
+  ssvid IN (select mmsi from carrier_vessels) AND
+DATE(loitering_start_timestamp) >= minimum() 
+  AND DATE(loitering_end_timestamp) <= maximum() 
+  AND avg_distance_from_shore_nm > dist_from_shore() 
+  AND loitering_hours>=min_duration() 
+  AND loitering_hours<=max_duration() 
+  --removes loitering events associated with 'noisey' segment IDs
+  AND
+  seg_id IN (
+  SELECT
+  seg_id
+  FROM
+  `gfw_research.pipe_v20201001_segs`
+  WHERE
+  good_seg
+  AND NOT overlapping_and_short
+  )
+  )
+  GROUP BY
+  vessel_id,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  start_lon,
+  start_lat,
+  end_lon,
+  end_lat,
+  mean_lon,
+  mean_lat
+  )
+  ),
+--####
+--Identify restricted loitering events by carriers
+--time range of carriers should overlap with the time of encounters to ensure they are actively transmitting during
+--as carriers during the time of encounters
+loits_f as(
+  SELECT
+  vessel_id,
+  start_lat,
+  start_lon,
+  end_lat,
+  end_lon,
+  mean_lon,
+  mean_lat,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm
+  FROM (
+  SELECT 
+  *
+  FROM loitering ) a
+  JOIN(
+  SELECT
+  mmsi as carrier_ssvid,
+  year as carrier_year,
+  flag as carrier_flag
+  FROM
+  carrier_vessels ) b
+  ON
+  SAFE_CAST(a.vessel_id as STRING)=SAFE_CAST(b.carrier_ssvid as STRING)
+  AND EXTRACT(YEAR FROM a.loitering_start_timestamp) = b.carrier_year),
+--####
+--add rfmo polygon shapefile of interest
+rfmo as(
+  SELECT
+  st_GeogFromText(string_field_1, make_valid=>TRUE) AS iotc
+  FROM
+  `ocean_shapefiles_all_purpose.IOTC_shape_feb2021`),
+--
+--specify that you only when when loitering events are IN IOTC
+--
+--
+--specify that you only when when loitering events are IN IOTC
+--
+loits_upd1_a as (
+  SELECT
+  --TO_HEX(MD5(FORMAT("%s|%t", vessel_id, loitering_start_timestamp))) AS loits_id,
+  vessel_id,
+  start_lat,
+  start_lon,
+  end_lat,
+  end_lon,
+  mean_lon,
+  mean_lat,
+  FORMAT("lon:%+07.2f_lat:%+07.2f", ROUND(mean_lon/0.01)*0.01, ROUND(mean_lat/0.01)*0.01) AS gridcode,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm
+  FROM 
+  loits_f, rfmo
+  WHERE ST_CONTAINS(rfmo.iotc, ST_GEOGPOINT(mean_lon, mean_lat))),
+--
+--add overlap rfmo polygon shapefile of interest
+--
+ccsbt_rfmo as(
+  SELECT
+  st_GeogFromText(string_field_1, make_valid=>TRUE) AS ccsbt
+  FROM
+  `ocean_shapefiles_all_purpose.CCSBT_shape_feb2021`),
+  
+--identify encounters in rfmo overlap with IOTC
+loits_upd1 as(
+  SELECT
+  loits_id,
+  vessel_id,
+  start_lat,
+  start_lon,
+  end_lat,
+  end_lon,
+  mean_lon,
+  mean_lat,
+  gridcode,
+  loitering_start_timestamp,
+  loitering_end_timestamp,
+  loitering_hours,
+  tot_distance_nm,
+  avg_speed_knots,
+  avg_distance_from_shore_nm,
+  ccsbt_overlap
+  FROM(
+    SELECT
+    *,
+    ST_CONTAINS(ccsbt,
+                ST_GeogPoint(mean_lon,
+                             mean_lat)) as ccsbt_overlap
+    FROM(
+      SELECT *
+        FROM loits_upd1_a)a
+    CROSS JOIN(
+      SELECT
+      *
+        FROM
+      ccsbt_rfmo)b)
+  ),
+--------
+--use grid codes to attach eez code
+---
+loits_upd2 as (
+  SELECT
+  *
+  FROM ( 
+  SELECT
+  *
+  FROM
+  loits_upd1 ) a
+  ---left join here otherwise you will remove instances when eez is null (when vessel in high seas)
+  LEFT JOIN (
+  SELECT
+  gridcode as gridcode_eez,
+  regions.eez as regions_eez,
+  FROM 
+  `world-fishing-827.pipe_static.regions` ) b
+  ON a. gridcode = b. gridcode_eez
+  ),
+--make grid codes numeric and attach iso3 codes to eez grid codes
+loits_upd3 as (
+  SELECT
+  *
+  FROM ( SELECT
+  *
+  FROM
+  loits_upd2
+  LEFT JOIN UNNEST(regions_eez) as eez_code ) a
+  LEFT JOIN (
+    SELECT
+    eez_id,
+    territory1_iso3 AS eez_iso3,
+    FROM
+    `gfw_research.eez_info`)b
+    ON SAFE_CAST(a.eez_code AS int64) =SAFE_CAST(b.eez_id as int64)),
+-----
+--add column to indicate which events happened in eez
+---
+loits_upd as (
+  SELECT
+  * EXCEPT (regions_eez, eez_code, eez_id),
+  CASE WHEN eez_id IS NOT NULL
+   THEN "TRUE"
+    ELSE "FALSE"
+     END AS in_eez,
+  FROM
+  loits_upd3)
+SELECT *
+FROM 
+loits_upd
+WHERE 
+eez_iso3 IS NULL
+GROUP BY 
+1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19
+
+```
+
+## 3. How many loitering events by carriers occurred in IOTC in 2020?
+
+## 4. How many of the carriers from question 3 were authorized by IOTC or CCSBT during the time of their loitering events?
+
+## 5. Do the results from 1,2,or 3 differ from the values shown in the CVP? If so, why?
+
+## 6. How many loitering events that don't overlap with encounters by the same vessel occur by carriers in IOTC in 2020?
+
+# **Voyages/Port Visits**
+
+[ports and voyages presentation](https://docs.google.com/presentation/d/1CNL-hUbZGkj41siUWPi4QvHgz82Ohe_G1fLHMfSjXu4/edit#slide=id.g7b6fe9f445_0_16)
+
+## 1. How many voyages did Tuna Queen have in 2018 based on a port visit confidence of 4?
+
+[Tuna Queen 2018 - CVP](https://globalfishingwatch.org/carrier-portal/?dataset=carriers:v20210701&layer%5B0%5D=encounter&layer%5B1%5D=cp_rfmo&layer%5B2%5D=cp_next_port&latitude=11.6059128&longitude=88.3745982&zoom=1.9888562&vessel=1512ca283-37b5-2737-87b9-047cf0f30433&start=2018-01-01&end=2018-12-31)
+
+```{sql connection = con, output.var = 'voyages_c4'}
+
+select 
+  distinct count(trip_id) as voyage_count
+from(
+  select
+    *
+  from 
+    `world-fishing-827.pipe_production_v20201001.proto_voyages_c4`
+  where 
+    ssvid = '352894000' and
+    trip_start <= timestamp('2018-12-31') and trip_end >= timestamp('2018-01-01')
+)
+
+```
+
+```{r}
+
+dim(voyages_c4)[1]
+
+```
+
+## 2. How does this number change if you restrict the confidence to at least 2 or at least 3 compared to confidence of 4? Why does it change?
+
+```{sql connection= con}
+
+
+-- Filter Port Events query
+-- Hannah Linder, July 30, 2021
+--
+-- This query 
+--  1. Uses the new prototype port visits dataset with a confidence of 3 
+--  2. Unnest port visits to look at individual port events
+--  3. Filter port events to only look at the port of Abdijan
+-- 4. Connect port events to anchorage label information
+------------------------------------------------------------
+WITH 
+------------------------------------------------------------
+-- Port Events Source data
+-- adjust the time range here 
+------------------------------------------------------------
+port_events AS (
+SELECT  
+visit_id,
+vessel_id,
+ssvid,
+start_timestamp,
+end_timestamp,
+duration_hrs,
+confidence,
+e.timestamp as event_timestamp,
+e.vessel_lat as event_lat,
+e.vessel_lon as event_lon,
+e.anchorage_id as anchorage_id,
+e.event_type as event_type
+FROM `pipe_production_v20201001.proto_port_visits`
+LEFT JOIN UNNEST (events) e
+WHERE start_timestamp BETWEEN timestamp("2018-01-01") AND timestamp("2018-01-31")
+AND confidence>=2),
+------------------------------------------------------------
+-- Mapping vessel_id to SSVID
+------------------------------------------------------------
+anchorages AS (
+SELECT
+  *
+FROM
+  `world-fishing-827.gfw_research.named_anchorages`),
+--------------------
+-- Filter for Anchorages in Ivory Coast
+--------------------
+civ_anchorages AS (
+SELECT
+  *
+FROM
+  anchorages
+
+),
+------
+
+
+final as (
+SELECT
+* EXCEPT (s2id)
+FROM(
+SELECT
+visit_id,
+vessel_id,
+ssvid,
+start_timestamp,
+end_timestamp,
+duration_hrs,
+confidence,
+event_timestamp,
+event_lat,
+event_lon,
+anchorage_id,
+event_type
+FROM
+port_events)a
+JOIN(
+SELECT
+s2id,
+label as end_label,
+sublabel as end_sublabel,
+iso3 as end_iso3,
+distance_from_shore_m as end_dist_from_shore_m,
+at_dock as end_at_dock
+FROM
+civ_anchorages)b
+ON
+a.anchorage_id=b.s2id
+
+)
+
+
+
+SELECT
+*
+FROM
+final
+WHERE 
+start_timestamp <='2018-12-31'
+AND
+end_timestamp >='2018-01-01'
+AND 
+ssvid='352894000'
+
+```
+
+## 3. How many port events occurred in the port visit associated with the voyage that ended in Zadar on January 20, 2018?
+
+```{sql connection=con, output.var = 'events_zadar'}
+
+-- Filter Port Events query
+-- Hannah Linder, July 30, 2021
+--
+-- This query 
+--  1. Uses the new prototype port visits dataset with a confidence of 3 
+--  2. Unnest port visits to look at individual port events
+--  3. Filter port events to only look at the port of Abdijan
+-- 4. Connect port events to anchorage label information
+------------------------------------------------------------
+WITH 
+------------------------------------------------------------
+-- Port Events Source data
+-- adjust the time range here 
+------------------------------------------------------------
+port_events AS (
+SELECT  
+    visit_id,
+    vessel_id,
+    ssvid,
+    start_timestamp,
+    end_timestamp,
+    duration_hrs,
+    confidence,
+    e.timestamp as event_timestamp,
+    e.vessel_lat as event_lat,
+    e.vessel_lon as event_lon,
+    e.anchorage_id as anchorage_id,
+    e.event_type as event_type
+FROM 
+    `pipe_production_v20201001.proto_port_visits`
+LEFT JOIN UNNEST (events) e
+WHERE 
+    start_timestamp BETWEEN timestamp("2018-01-01")
+    AND timestamp("2018-01-31")
+    AND confidence>=2),
+------------------------------------------------------------
+-- Mapping vessel_id to SSVID
+------------------------------------------------------------
+anchorages AS (
+SELECT
+  *
+FROM
+  `world-fishing-827.gfw_research.named_anchorages`),
+
+
+------------------------------------------------------------
+
+
+final as (
+SELECT
+    * EXCEPT (s2id)
+FROM(
+    SELECT
+        visit_id,
+        vessel_id,
+        ssvid,
+        start_timestamp,
+        end_timestamp,
+        duration_hrs,
+        confidence,
+        event_timestamp,
+        event_lat,
+        event_lon,
+        anchorage_id,
+        event_type
+    FROM
+        port_events)a
+    JOIN(
+      SELECT
+      s2id,
+      label as end_label,
+      sublabel as end_sublabel,
+      iso3 as end_iso3,
+      distance_from_shore_m as end_dist_from_shore_m,
+      at_dock as end_at_dock
+      FROM
+      anchorages)b
+      ON
+      a.anchorage_id=b.s2id
+
+)
+
+SELECT
+*
+FROM
+final
+WHERE 
+start_timestamp <='2018-12-31'
+AND
+end_timestamp >='2018-01-01'
+AND 
+ssvid='352894000'
+```
+
+```{r}
+
+events_zadar %>%
+  filter(end_label == 'ZADAR') %>%
+
+
+```
+
+## 4. What is the count of port visits per port based on the end of the voyages in 2018 for Tuna Queen(based on a confidence of 3 and for the 'right' Tuna Queen)?
+
+```{r}
+
+
+
+
+
+
+```
+
+## 5. What ports were visited after loitering events, that were at least 4 hours and less than or equal to 24 hours, avg 20 nm from shore, and less than 2 knots, by carriers in IOTC in 2020 (based on confidence of 4)? What is the number of port visits at each of these ports?
+
+# **Now Put it Together**
+
+\

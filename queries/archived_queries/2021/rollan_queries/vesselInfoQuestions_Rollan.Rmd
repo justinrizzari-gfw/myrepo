@@ -1,0 +1,209 @@
+---
+title: "Training Questions"
+author: "Rollan Geronimo"
+date: "8/11/2021"
+output: 
+  bookdown::html_document2: 
+    toc: true
+    code_folding: hide
+    toc_depth: 2.0
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries, include=FALSE}
+library(bigrquery)
+library(fishwatchr)
+library(dplyr)
+library(countrycode)
+library(kableExtra)
+library(ggplot2)
+library(glue)
+library(tidyverse)
+library(raster)
+library(sf)
+library(kableExtra)
+library(DT)
+
+BQ_connection <-  dbConnect(bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+con <- DBI::dbConnect(drv = bigrquery::bigquery(), project = "world-fishing-827", use_legacy_sql = FALSE)
+```
+
+# Vessel Info Questions
+
+## Vessel info query
+**1.	What is the name, callsign, flag state, and imo of the vessel with mmsi  353154000 during 2018?**
+
+In 2018, the vessel with MMSI of 353154000 had different registry and AIS names ("KINGBEANS" vs. "CABO DE PALOS"), callsign ("3FKO6" vs. "HP5179"), and imo ("9550151" vs. "7363700"). Both the registry information and AIS indiate the same flag state: Panama.
+
+```{r vesselInfo_Q1, echo = TRUE, message = FALSE, warning = FALSE}
+
+ssvid = '353154000'
+year = 2018
+
+query_vesselInfo<- c("
+  SELECT 
+  ssvid AS mmsi,
+  year AS year,
+  registry_info.best_known_shipname AS registry_name,
+  ais_identity.shipname_mostcommon.value AS ais_name,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo,
+  best.best_vessel_class AS vessel_class
+  FROM `world-fishing-827.gfw_research.vi_ssvid_byyear_v20210913`
+   WHERE 
+   ssvid = '353154000'
+   AND
+   year = 2018
+")
+
+
+vesselInfo <- gfw_query(query = query_vesselInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselInfo %>%
+  kable(caption = sprintf("Vessel information for %s for year %s",ssvid,year)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+## Pulling from different tables
+
+**2.	Is the above answer different if you pull from the vessel info table (gfw_research.vi_ssvid_v) versus the vessel registry table (vessel_database.all_vessels_v)?**
+
+*The two tables, "gfw_research.vi_ssvid_v" and "vessel_database.all_vessels_v", does not have a "year" field.*
+*There are multiple returns for vessel_database.all_vessels_v versus the gfw_research.vi_ssvid_v query.*
+
+
+```{r vesselInfo_Q2a, echo = TRUE, message = FALSE, warning = FALSE}
+query_vesselInfo_vi <- c("
+  SELECT 
+  ssvid AS mmsi,
+  registry_info.best_known_shipname AS registry_name,
+  ais_identity.shipname_mostcommon.value AS ais_name,
+  registry_info.best_known_callsign AS registry_callsign,
+  ais_identity.n_callsign_mostcommon.value AS ais_callsign,
+  registry_info.best_known_flag AS registry_flag,
+  ais_identity.flag_mmsi AS ais_flag,
+  registry_info.best_known_imo AS registry_imo,
+  ais_identity.n_imo_mostcommon.value AS ais_imo,
+  best.best_vessel_class
+  FROM `world-fishing-827.gfw_research.vi_ssvid_v20210913`
+   WHERE 
+   ssvid = '353154000'
+")
+
+vesselInfo_vi <- gfw_query(query = query_vesselInfo_vi, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselInfo_vi %>%
+  kable(caption = sprintf("Vessel information for %s for year %s from gfw_research.vi_ssvid_v20210706",ssvid,year)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+```{r vesselInfo_Q2b, echo = TRUE, message = FALSE, warning = FALSE}
+query_vesselInfo_allVessels <- c("
+  SELECT 
+  identity.ssvid AS mmsi,
+  identity.n_shipname AS name,
+  identity.n_callsign AS callsign,
+  identity.flag AS flag,
+  identity.imo AS imo,
+  a.messages AS AIS_messages,
+  a.first_timestamp,
+  a.last_timestamp,
+  is_carrier,
+  is_fishing
+  FROM `world-fishing-827.vessel_database.all_vessels_v20211001`
+  LEFT JOIN UNNEST (activity) a
+  WHERE 
+    identity.ssvid = '353154000' AND
+    a.first_timestamp <= timestamp('2021-12-31') AND
+    a.last_timestamp >= timestamp('2021-01-01')
+")
+
+vesselInfo_allVessels <- gfw_query(query = query_vesselInfo_allVessels, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+vesselInfo_allVessels %>%
+  kable(caption = sprintf("Vessel information for %s for year %s from vessel_database.all_vessels_v20211001",ssvid,year)) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = F,font_size=12)
+
+```
+
+## Using vi_ssvid_byyear_v
+
+**3.	Should you use gfw_research.vi_ssvid_v or gfw_research.vi_ssvid_byyear_v to answer question 1 in the vessel info section?**
+
+*Since question 1 asks for the vessel identity for a specific year (i.e., 2018), the "gfw_research.vi_ssvid_byyear_v" table should be used. Vessel identity details could change over time and "gfw_research.vi_ssvid_v" contains the most common identity values.*
+
+## Carrier vessel?
+
+**4.	Is the vessel considered a ‘carrier’? **
+
+No. Based on the table "gfw_research.vi_ssvid_byyear_v20210706", the best vessel classification for the given mmsi is "cargo".
+
+## Fishing vessel?
+
+**5.	Is the vessel a fishing vessel? What are different ways you could determine if the vessel was a fishing vessel? **
+
+No. It is not a fishing vessel.  The ways to determine if the vessel was a fishing vessel are:
+
++ from vi_ssvid_byyear_vYYYYMMDD: 
+  + on_fishing_list_known - Listed as a fishing vessel on 1+ registries
+  + on_fishing_list_sr - Consistently self reports as fishing in AIS messages >98% of messages; minimum 50 positions
+  + on_fishing_list_nn - The neural net believes the vessel is more likely a fishing vessel than a non-fishing vessel combined neural net score for fishing classes > 0.5
+  + on_fishing_list_best
++ check if the ssvid is in the fishing_vessels_ssvid_vYYYYMMDD table
+
+## Vessel class
+
+**6.	What is considered based on the best vessel class? Does this differ from what it is considered when looking at vessel_database.all_vessels_v?**
+
+*Best vessel class considers information from vessel registries, AIS activity, and inferred from the GFW neural net results. The vessel_database.all_vessels_v contains information only from vessel registries.*
+
+## RFMO authority
+
+**7.	Was the vessel ‘authorized’ by any RFMO during 2018? If so, which ones and what are the registry periods?**
+
+*Yes. The vessel was authorized during 2018 by ICCAT.*
+
+Why are there duplicates in my query result below? I had to use GROUP BY to get distinct rows.
+
+```{r vesselInfo_Q7, echo = TRUE, message = FALSE, warning = FALSE}
+
+query_regInfo <- c("
+  SELECT 
+  identity.ssvid AS mmsi,
+  identity.n_shipname AS name,
+  identity.n_callsign AS callsign,
+  identity.flag AS flag,
+  identity.imo AS imo,
+  registry.authorized_from,
+  registry.authorized_to,
+  registry.list_uvi,
+  FROM `world-fishing-827.vessel_database.all_vessels_v20210601`,
+    UNNEST(registry) AS registry
+  WHERE 
+    identity.ssvid = '353154000'
+  GROUP BY 1,2,3,4,5,6,7,8
+")
+
+regInfo <- gfw_query(query = query_regInfo, 
+                          run_query = TRUE, 
+                          con = con)$data
+
+datatable(regInfo, caption = sprintf("Registry information for %s for year %s from vessel_database.all_vessels_v20210601",ssvid,year)) 
+```
+
