@@ -2,8 +2,7 @@
 title: "helloR"
 author: "Justin Rizzari"
 date: "2024-07-26"
-output: html_document:
-  keep_md: true
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
